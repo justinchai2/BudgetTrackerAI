@@ -8,11 +8,20 @@ PLAID_CLIENT_ID = os.getenv("PLAID_CLIENT_ID")
 PLAID_SECRET = os.getenv("PLAID_SECRET")
 PLAID_ENV = os.getenv("PLAID_ENV", "sandbox")
 
-PLAID_ACCESS_TOKENS = {
-    "Chase":       os.getenv("PLAID_ACCESS_TOKEN_CHASE"),
-    "Citi":        os.getenv("PLAID_ACCESS_TOKEN_CITI"),
-    "Capital One": os.getenv("PLAID_ACCESS_TOKEN_CAPITAL_ONE"),
-}
+def _load_plaid_tokens():
+    """Auto-discovers any PLAID_ACCESS_TOKEN_<BANK> entries in .env.
+    The suffix becomes the bank name (underscores → spaces, title-cased).
+    Example: PLAID_ACCESS_TOKEN_WELLS_FARGO → 'Wells Fargo'
+    """
+    tokens = {}
+    prefix = "PLAID_ACCESS_TOKEN_"
+    for key, val in os.environ.items():
+        if key.startswith(prefix) and val:
+            bank_name = key[len(prefix):].replace("_", " ").title()
+            tokens[bank_name] = val
+    return tokens
+
+PLAID_ACCESS_TOKENS = _load_plaid_tokens()
 
 # Google Sheets
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")

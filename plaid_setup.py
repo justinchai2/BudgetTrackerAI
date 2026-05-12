@@ -1,10 +1,19 @@
 """
 One-time setup script — run this once per bank to get your Plaid access tokens.
-It starts a local server, opens Plaid Link in your browser, and prints the
+Starts a local server, opens Plaid Link in your browser, and prints the
 access token to paste into your .env file.
 
 Usage:
     python plaid_setup.py
+
+Works for any bank Plaid supports. Handles both standard and OAuth banks
+(Chase, Bank of America, Wells Fargo, etc.) in production.
+
+Production setup:
+    1. Set PLAID_ENV=production and your production PLAID_SECRET in .env
+    2. Register http://localhost:8080/oauth-return in Plaid dashboard:
+       Dashboard → Team Settings → API → Redirect URIs
+    3. Run this script for each bank you want to connect
 """
 
 import json
@@ -28,7 +37,10 @@ ENV_MAP = {
     "production": plaid.Environment.Production,
 }
 
-CALLBACK_PORT = 8080
+CALLBACK_PORT   = 8080
+REDIRECT_URI    = f"http://localhost:{CALLBACK_PORT}/oauth-return"
+IS_PRODUCTION   = PLAID_ENV == "production"
+
 captured_public_token = None
 
 def get_client():
@@ -39,36 +51,40 @@ def get_client():
     return plaid_api.PlaidApi(plaid.ApiClient(configuration))
 
 def create_link_token():
-    client = get_client()
-    request = LinkTokenCreateRequest(
+    client  = get_client()
+    kwargs  = dict(
         user=LinkTokenCreateRequestUser(client_user_id="budget-tracker-user"),
         client_name="BudgetTrackerAI",
         products=[Products("transactions")],
         country_codes=[CountryCode("US")],
         language="en",
     )
-    response = client.link_token_create(request)
+    # Production OAuth banks (Chase, BofA, Wells Fargo, etc.) require redirect_uri
+    if IS_PRODUCTION:
+        kwargs["redirect_uri"] = REDIRECT_URI
+
+    response = client.link_token_create(LinkTokenCreateRequest(**kwargs))
     return response["link_token"]
 
 def exchange_public_token(public_token):
-    client = get_client()
-    request = ItemPublicTokenExchangeRequest(public_token=public_token)
+    client   = get_client()
+    request  = ItemPublicTokenExchangeRequest(public_token=public_token)
     response = client.item_public_token_exchange(request)
     return response["access_token"]
 
-# Minimal HTML page that runs Plaid Link and redirects with the public token
-LINK_PAGE = """
-<!DOCTYPE html>
+# Main Plaid Link page
+LINK_PAGE = """<!DOCTYPE html>
 <html>
 <head><title>BudgetTrackerAI — Link Bank</title></head>
 <body>
 <h2>Connecting your bank...</h2>
 <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
 <script>
-  const handler = Plaid.create({{
+  var handler = Plaid.create({{
     token: "{link_token}",
     onSuccess: function(public_token, metadata) {{
-      window.location = "/callback?public_token=" + public_token + "&institution=" + encodeURIComponent(metadata.institution.name);
+      window.location = "/callback?public_token=" + public_token
+        + "&institution=" + encodeURIComponent(metadata.institution.name);
     }},
     onExit: function(err) {{
       document.body.innerHTML = "<h2>Cancelled.</h2><p>Close this window and try again.</p>";
@@ -77,60 +93,86 @@ LINK_PAGE = """
   handler.open();
 </script>
 </body>
-</html>
-"""
+</html>"""
+
+# OAuth return page — re-initializes Plaid Link to complete the OAuth flow
+OAUTH_RETURN_PAGE = """<!DOCTYPE html>
+<html>
+<head><title>BudgetTrackerAI — OAuth Return</title></head>
+<body>
+<h2>Completing bank connection...</h2>
+<script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+<script>
+  var handler = Plaid.create({{
+    token: "{link_token}",
+    receivedRedirectUri: window.location.href,
+    onSuccess: function(public_token, metadata) {{
+      window.location = "/callback?public_token=" + public_token
+        + "&institution=" + encodeURIComponent(metadata.institution.name);
+    }},
+    onExit: function(err) {{
+      document.body.innerHTML = "<h2>Cancelled.</h2><p>Close this window and try again.</p>";
+    }}
+  }});
+  handler.open();
+</script>
+</body>
+</html>"""
+
+# Store the link token so the OAuth return page can reuse it
+_current_link_token = None
 
 class CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        global captured_public_token
+        global captured_public_token, _current_link_token
         parsed = urlparse(self.path)
 
         if parsed.path == "/":
-            link_token = create_link_token()
-            html = LINK_PAGE.format(link_token=link_token)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(html.encode())
+            _current_link_token = create_link_token()
+            html = LINK_PAGE.format(link_token=_current_link_token)
+            self._respond(200, html)
+
+        elif parsed.path == "/oauth-return":
+            # OAuth bank returned — re-open Link with the same token + receivedRedirectUri
+            html = OAUTH_RETURN_PAGE.format(link_token=_current_link_token or "")
+            self._respond(200, html)
 
         elif parsed.path == "/callback":
-            params = parse_qs(parsed.query)
-            public_token  = params.get("public_token", [None])[0]
-            institution   = params.get("institution", ["Unknown Bank"])[0]
+            params       = parse_qs(parsed.query)
+            public_token = params.get("public_token", [None])[0]
+            institution  = params.get("institution", ["Unknown Bank"])[0]
 
             if public_token:
                 access_token = exchange_public_token(public_token)
                 captured_public_token = access_token
 
-                # Show result in browser
                 env_key = institution.upper().replace(" ", "_")
-                html = f"""
-                <html><body>
-                <h2>✅ {institution} connected!</h2>
-                <p>Add this to your <strong>.env</strong> file:</p>
-                <pre>PLAID_ACCESS_TOKEN_{env_key}={access_token}</pre>
-                <p>You can close this window.</p>
-                </body></html>
-                """
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html")
-                self.end_headers()
-                self.wfile.write(html.encode())
+                html = f"""<html><body>
+<h2>&#x2705; {institution} connected!</h2>
+<p>Add this to your <strong>.env</strong> file:</p>
+<pre>PLAID_ACCESS_TOKEN_{env_key}={access_token}</pre>
+<p>You can close this window and run the script again for another bank.</p>
+</body></html>"""
+                self._respond(200, html)
 
                 print(f"\n✅  {institution} connected!")
                 print(f"    Add to .env:  PLAID_ACCESS_TOKEN_{env_key}={access_token}\n")
-
-                # Shut down server after a short delay
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
             else:
-                self.send_response(400)
-                self.end_headers()
+                self._respond(400, "<html><body>Missing public_token.</body></html>")
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._respond(404, "<html><body>Not found.</body></html>")
+
+    def _respond(self, status, html):
+        body = html.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, format, *args):
-        pass  # suppress default request logs
+        pass  # suppress request logs
 
 def validate_credentials():
     errors = []
@@ -145,19 +187,22 @@ def validate_credentials():
         raise SystemExit(1)
 
 def main():
-    print("=" * 55)
+    print("=" * 60)
     print("  BudgetTrackerAI — Plaid Bank Setup")
-    print("=" * 55)
-
+    print("=" * 60)
     validate_credentials()
+    print(f"\nEnvironment: {PLAID_ENV.upper()}")
 
-    print(f"\nEnvironment: {PLAID_ENV}")
-    print("\nStarting local server on http://localhost:8080 ...")
-    print("Opening Plaid Link in your browser.\n")
-    print("Run this script once for each bank:")
-    print("  1. Chase")
-    print("  2. Citi")
-    print("  3. Capital One\n")
+    if IS_PRODUCTION:
+        print("\n⚠️  Production mode — make sure you have:")
+        print("   1. Switched to your Production secret in .env")
+        print("   2. Registered the redirect URI in Plaid dashboard:")
+        print(f"      {REDIRECT_URI}")
+        print("      (Dashboard → Team Settings → API → Redirect URIs)")
+
+    print(f"\nStarting local server on http://localhost:{CALLBACK_PORT} ...")
+    print("A browser window will open. Connect any bank Plaid supports.")
+    print("Run this script once per bank. The access token prints here and in the browser.\n")
 
     webbrowser.open(f"http://localhost:{CALLBACK_PORT}/")
     server = HTTPServer(("localhost", CALLBACK_PORT), CallbackHandler)
