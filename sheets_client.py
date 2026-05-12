@@ -177,7 +177,27 @@ def _write_summary(sheet, transactions, budget_limits):
 
     ws.update(rows, "A1")
     _style_header_row(sheet, ws)
-    print(f"[sheets] Summary written ({len(rows) - 1} categories)")
+
+    # Bank date ranges — earliest and latest transaction per bank
+    bank_dates = {}
+    for t in transactions:
+        bank = t["bank"]
+        d    = t["date"]
+        if bank not in bank_dates:
+            bank_dates[bank] = {"earliest": d, "latest": d}
+        else:
+            if d < bank_dates[bank]["earliest"]:
+                bank_dates[bank]["earliest"] = d
+            if d > bank_dates[bank]["latest"]:
+                bank_dates[bank]["latest"] = d
+
+    date_range_start = len(rows) + 3
+    date_rows = [["Bank", "Earliest Transaction", "Latest Transaction"]]
+    for bank in sorted(bank_dates):
+        date_rows.append([bank, bank_dates[bank]["earliest"], bank_dates[bank]["latest"]])
+
+    ws.update(date_rows, f"A{date_range_start}")
+    print(f"[sheets] Summary written ({len(rows) - 1} categories, {len(bank_dates)} banks)")
 
 def sync_subscriptions(recurring_streams):
     gc    = _get_client()
