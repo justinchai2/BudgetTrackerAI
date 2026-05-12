@@ -139,6 +139,7 @@ Categorize each merchant below into exactly one of these budget categories:
 
 Rules:
 - Use only the categories listed above, exactly as written
+- "Necessities" covers rent, car payments, and utilities (electric, gas, water, internet, phone bills)
 - Base your decision on the merchant name and the Plaid category hint
 - Assign a confidence score from 0.0 to 1.0 (how certain you are)
   - 1.0 = completely obvious (e.g. "McDonald's" -> "Food and Drink")

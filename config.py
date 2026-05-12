@@ -67,7 +67,7 @@ BUDGET_LIMITS = {
     "Shopping":             300,
     "Health and Fitness":   150,
     "Gas":                  200,
-    "Utilities":            250,
+    "Necessities":            250,
     "Other":                300,
 }
 
@@ -84,6 +84,6 @@ LARGE_TRANSACTION_BY_CATEGORY = {
     "Shopping":             150,
     "Health and Fitness":   100,
     "Gas":                  80,
-    "Utilities":            200,
+    "Necessities":            200,
     "Other":                100,
 }
