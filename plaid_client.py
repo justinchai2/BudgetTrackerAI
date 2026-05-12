@@ -53,7 +53,7 @@ def fetch_transactions(bank_name, access_token, days_back=TRANSACTION_LOOKBACK_D
         response = client.transactions_get(paged)
         transactions.extend(response["transactions"])
 
-    return [_normalize(bank_name, txn) for txn in transactions]
+    return [_normalize(bank_name, txn) for txn in transactions if txn["amount"] != 0]
 
 def _normalize(bank_name, txn):
     return {
