@@ -6,6 +6,7 @@ service_account.json
 alerted_ids.json
 merchant_cache.json
 uncertain_merchants.json
+transactions.db
 
 # Python
 __pycache__/

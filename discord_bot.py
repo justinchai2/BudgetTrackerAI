@@ -14,6 +14,7 @@ from config import (
 )
 from plaid_client import fetch_all_transactions, fetch_all_recurring
 from sheets_client import sync_transactions, sync_subscriptions, read_custom_category_overrides
+import db as transaction_db
 from budget_engine import check_budget_overages, check_large_transactions, get_budget_summary
 from gemini_client import (
     categorize_transactions, generate_budget_summary, generate_subscription_summary,
@@ -50,16 +51,22 @@ async def run_full_sync(source="manual"):
     # 2. Gemini categorization
     transactions, uncertain = categorize_transactions(transactions)
 
-    # 3. Sync to Google Sheets
-    sync_transactions(transactions, BUDGET_LIMITS)
+    # 3. Persist to SQLite and purge anything older than 2 years
+    transaction_db.upsert_transactions(transactions)
+    transaction_db.purge_old_transactions(730)
+
+    # 4. Sync year-to-date from DB to Google Sheets
+    ytd = transaction_db.get_year_to_date_transactions()
+    sync_transactions(ytd, BUDGET_LIMITS)
 
     # Fetch and sync recurring/subscriptions
     streams = fetch_all_recurring()
     if streams:
         sync_subscriptions(streams)
 
-    # 4. Budget overage alerts
-    overages = check_budget_overages(transactions)
+    # 5. Budget overage alerts — current month only
+    current_month = transaction_db.get_current_month_transactions()
+    overages = check_budget_overages(current_month)
     for overage in overages:
         msg = generate_overage_message(overage)
         target = alert_channel or digest_channel
@@ -70,8 +77,8 @@ async def run_full_sync(source="manual"):
             f"(${overage['over_by']} over · {overage['pct_used']}% used)"
         )
 
-    # 5. Large transaction alerts
-    large_txns = check_large_transactions(transactions)
+    # 6. Large transaction alerts — current month only
+    large_txns = check_large_transactions(current_month)
     for txn in large_txns:
         target = alert_channel or digest_channel
         await target.send(
@@ -164,6 +171,7 @@ class RecategorizeSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         chosen = self.values[0]
         save_user_category(self.merchant, chosen)
+        transaction_db.update_merchant_category(self.merchant, chosen)
 
         # Re-sync sheets with updated category
         await interaction.response.send_message(
@@ -173,7 +181,8 @@ class RecategorizeSelect(discord.ui.Select):
         )
         transactions = fetch_all_transactions()
         transactions, _ = categorize_transactions(transactions)
-        sync_transactions(transactions, BUDGET_LIMITS)
+        transaction_db.upsert_transactions(transactions)
+        sync_transactions(transaction_db.get_year_to_date_transactions(), BUDGET_LIMITS)
 
         channel = bot.get_channel(DISCORD_CHANNEL_ID)
         if channel:
@@ -202,9 +211,7 @@ async def sync_cmd(interaction: discord.Interaction):
 async def budget_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    transactions = fetch_all_transactions()
-    transactions, _ = categorize_transactions(transactions)
-    summary = get_budget_summary(transactions)
+    summary = get_budget_summary(transaction_db.get_current_month_transactions())
 
     lines = ["**Budget Status — This Month**\n"]
     for c in summary["categories"]:
@@ -370,6 +377,7 @@ async def daily_digest():
 @bot.event
 async def on_ready():
     print(f"[bot] Logged in as {bot.user} ({bot.user.id})")
+    transaction_db.init_db()
 
     try:
         guild  = discord.Object(id=DISCORD_GUILD_ID)
