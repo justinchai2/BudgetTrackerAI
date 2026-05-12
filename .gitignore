@@ -1,0 +1,15 @@
+# Secrets
+.env
+service_account.json
+
+# Runtime state — generated automatically, do not commit
+alerted_ids.json
+merchant_cache.json
+uncertain_merchants.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
