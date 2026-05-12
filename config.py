@@ -52,7 +52,7 @@ SYNC_HOURS = [9, 21]
 DIGEST_HOUR = 10
 
 # How many days back to pull transactions on each sync
-TRANSACTION_LOOKBACK_DAYS = 30
+TRANSACTION_LOOKBACK_DAYS = 132  # from Jan 1 2026
 
 # Pending transactions: show in Sheet but exclude from budget calculations and alerts
 COUNT_PENDING = False

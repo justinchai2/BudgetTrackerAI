@@ -23,8 +23,8 @@ def _save_alerted_ids(ids):
 
 def _get_posted(transactions):
     if COUNT_PENDING:
-        return transactions
-    return [t for t in transactions if not t["pending"]]
+        return [t for t in transactions if t["category"] != "Excluded"]
+    return [t for t in transactions if not t["pending"] and t["category"] != "Excluded"]
 
 def _category_totals(transactions):
     totals = {}
@@ -66,6 +66,8 @@ def check_large_transactions(transactions):
 
     for t in transactions:
         if t["pending"]:
+            continue
+        if t["category"] == "Excluded":
             continue
         if t["transaction_id"] in alerted_ids:
             continue
@@ -117,7 +119,7 @@ def get_budget_summary(transactions):
             "over_budget": spent > limit,
         })
 
-    total_spent   = round(sum(posted_totals.values()), 2)
+    total_spent   = round(sum(v for k, v in posted_totals.items() if k != "Excluded"), 2)
     total_limit   = sum(BUDGET_LIMITS.values())
     total_pending = round(sum(pending_totals.values()), 2)
 

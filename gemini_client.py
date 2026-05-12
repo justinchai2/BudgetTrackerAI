@@ -8,7 +8,7 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 MERCHANT_CACHE_FILE  = "merchant_cache.json"
 UNCERTAIN_CACHE_FILE = "uncertain_merchants.json"
-VALID_CATEGORIES     = list(BUDGET_LIMITS.keys())
+VALID_CATEGORIES     = list(BUDGET_LIMITS.keys()) + ["Excluded"]
 CONFIDENCE_THRESHOLD = 0.75
 
 def _load_cache():
