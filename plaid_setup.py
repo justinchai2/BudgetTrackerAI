@@ -3,20 +3,18 @@ One-time setup script — run this once per bank to get your Plaid access tokens
 Starts a local server, opens Plaid Link in your browser, and prints the
 access token to paste into your .env file.
 
-Usage:
+Usage (sandbox):
     python plaid_setup.py
 
-Works for any bank Plaid supports. Handles both standard and OAuth banks
-(Chase, Bank of America, Wells Fargo, etc.) in production.
-
-Production setup:
-    1. Set PLAID_ENV=production and your production PLAID_SECRET in .env
-    2. Register http://localhost:8080/oauth-return in Plaid dashboard:
-       Dashboard → Team Settings → API → Redirect URIs
-    3. Run this script for each bank you want to connect
+Usage (production):
+    1. Run: ngrok http 8080
+    2. Copy the https URL (e.g. https://abc123.ngrok-free.app)
+    3. Register <ngrok_url>/oauth-return in Plaid dashboard:
+       Dashboard -> Team Settings -> API -> Redirect URIs
+    4. Run: python plaid_setup.py https://abc123.ngrok-free.app
 """
 
-import json
+import sys
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -38,8 +36,12 @@ ENV_MAP = {
 }
 
 CALLBACK_PORT   = 8080
-REDIRECT_URI    = f"http://localhost:{CALLBACK_PORT}/oauth-return"
 IS_PRODUCTION   = PLAID_ENV == "production"
+
+# Optional: pass ngrok HTTPS base URL as first argument for production OAuth banks
+# e.g. python plaid_setup.py https://abc123.ngrok-free.app
+NGROK_BASE = sys.argv[1].rstrip("/") if len(sys.argv) > 1 else None
+REDIRECT_URI = f"{NGROK_BASE}/oauth-return" if NGROK_BASE else None
 
 captured_public_token = None
 
@@ -52,17 +54,15 @@ def get_client():
 
 def create_link_token():
     client  = get_client()
-    kwargs  = dict(
+    kwargs = dict(
         user=LinkTokenCreateRequestUser(client_user_id="budget-tracker-user"),
         client_name="BudgetTrackerAI",
         products=[Products("transactions")],
         country_codes=[CountryCode("US")],
         language="en",
     )
-    # Production OAuth banks (Chase, BofA, Wells Fargo, etc.) require redirect_uri
-    if IS_PRODUCTION:
+    if REDIRECT_URI:
         kwargs["redirect_uri"] = REDIRECT_URI
-
     response = client.link_token_create(LinkTokenCreateRequest(**kwargs))
     return response["link_token"]
 
@@ -95,7 +95,9 @@ LINK_PAGE = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# OAuth return page — re-initializes Plaid Link to complete the OAuth flow
+_current_link_token = None
+
+# OAuth return page — re-initializes Plaid Link after bank OAuth redirect
 OAUTH_RETURN_PAGE = """<!DOCTYPE html>
 <html>
 <head><title>BudgetTrackerAI — OAuth Return</title></head>
@@ -107,7 +109,7 @@ OAUTH_RETURN_PAGE = """<!DOCTYPE html>
     token: "{link_token}",
     receivedRedirectUri: window.location.href,
     onSuccess: function(public_token, metadata) {{
-      window.location = "/callback?public_token=" + public_token
+      window.location = "http://localhost:{port}/callback?public_token=" + public_token
         + "&institution=" + encodeURIComponent(metadata.institution.name);
     }},
     onExit: function(err) {{
@@ -118,9 +120,6 @@ OAUTH_RETURN_PAGE = """<!DOCTYPE html>
 </script>
 </body>
 </html>"""
-
-# Store the link token so the OAuth return page can reuse it
-_current_link_token = None
 
 class CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -133,8 +132,10 @@ class CallbackHandler(BaseHTTPRequestHandler):
             self._respond(200, html)
 
         elif parsed.path == "/oauth-return":
-            # OAuth bank returned — re-open Link with the same token + receivedRedirectUri
-            html = OAUTH_RETURN_PAGE.format(link_token=_current_link_token or "")
+            html = OAUTH_RETURN_PAGE.format(
+                link_token=_current_link_token or "",
+                port=CALLBACK_PORT,
+            )
             self._respond(200, html)
 
         elif parsed.path == "/callback":
@@ -155,7 +156,7 @@ class CallbackHandler(BaseHTTPRequestHandler):
 </body></html>"""
                 self._respond(200, html)
 
-                print(f"\n✅  {institution} connected!")
+                print(f"\n[OK] {institution} connected!")
                 print(f"    Add to .env:  PLAID_ACCESS_TOKEN_{env_key}={access_token}\n")
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
             else:
@@ -177,9 +178,9 @@ class CallbackHandler(BaseHTTPRequestHandler):
 def validate_credentials():
     errors = []
     if not PLAID_CLIENT_ID or "your_" in str(PLAID_CLIENT_ID):
-        errors.append("  ❌  PLAID_CLIENT_ID is missing or still a placeholder in .env")
+        errors.append("  [X]PLAID_CLIENT_ID is missing or still a placeholder in .env")
     if not PLAID_SECRET or "your_" in str(PLAID_SECRET):
-        errors.append("  ❌  PLAID_SECRET is missing or still a placeholder in .env")
+        errors.append("  [X]PLAID_SECRET is missing or still a placeholder in .env")
     if errors:
         print("\n".join(errors))
         print("\nOpen BudgetTrackerAI/.env and fill in your Plaid credentials.")
@@ -194,11 +195,14 @@ def main():
     print(f"\nEnvironment: {PLAID_ENV.upper()}")
 
     if IS_PRODUCTION:
-        print("\n⚠️  Production mode — make sure you have:")
-        print("   1. Switched to your Production secret in .env")
-        print("   2. Registered the redirect URI in Plaid dashboard:")
-        print(f"      {REDIRECT_URI}")
-        print("      (Dashboard → Team Settings → API → Redirect URIs)")
+        print("\n[!] Production mode -- make sure your Production secret is set in .env")
+        if REDIRECT_URI:
+            print(f"    Redirect URI: {REDIRECT_URI}")
+            print(f"    (must be registered in Plaid dashboard -> Team Settings -> API -> Redirect URIs)")
+        else:
+            print("\n    NOTE: No ngrok URL provided. OAuth banks (Chase, BofA, Wells Fargo) may fail.")
+            print("    To fix: run  ngrok http 8080  then rerun:")
+            print("      python plaid_setup.py https://<your-ngrok-id>.ngrok-free.app")
 
     print(f"\nStarting local server on http://localhost:{CALLBACK_PORT} ...")
     print("A browser window will open. Connect any bank Plaid supports.")
