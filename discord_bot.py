@@ -214,10 +214,10 @@ async def budget_cmd(interaction: discord.Interaction):
             icon = "🟡"
         else:
             icon = "🟢"
-        bar = f"{icon} **{c['category']}**: ${c['spent']} / ${c['limit']} ({c['pct_used']}%)"
+        line = f"{icon} **{c['category']}**: ${c['spent']} / ${c['limit']} ({c['pct_used']}%)"
         if c["pending"] > 0:
-            bar += f" _(+${c['pending']} pending)_"
-        lines.append(bar)
+            line += f" _(+${c['pending']} pending)_"
+        lines.append(line)
 
     lines.append(
         f"\n**Total: ${summary['total_spent']} / ${summary['total_limit']}** "

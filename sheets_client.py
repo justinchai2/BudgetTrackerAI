@@ -8,16 +8,19 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-BANK_TABS    = ["Chase", "Citi", "Capital One"]
-SUMMARY_TAB  = "Summary"
-SUBS_TAB     = "Subscriptions"
+BANK_TABS       = ["Chase", "Citi", "Capital One"]  # old tabs to remove if present
+TXN_TAB         = "Transactions"
+SUMMARY_TAB     = "Summary"
+SUBS_TAB        = "Subscriptions"
 
 TXN_HEADERS = [
-    "Date", "Merchant", "Category", "Amount", "Status", "Account ID", "Transaction ID",
-    "Custom Category"
+    "Date", "Bank", "Merchant", "Category", "Amount",
+    "Status", "Account ID", "Transaction ID", "Custom Category"
 ]
 
-CUSTOM_CAT_COL = 8   # column H (1-indexed)
+# Column indices (1-indexed)
+MERCHANT_COL   = 3   # column C
+CUSTOM_CAT_COL = 9   # column I
 
 SUMMARY_HEADERS = [
     "Category", "Total Spent", "Budget Limit", "Remaining", "% Used"
@@ -36,14 +39,22 @@ def _get_or_create_tab(sheet, title):
     try:
         return sheet.worksheet(title)
     except gspread.WorksheetNotFound:
-        return sheet.add_worksheet(title=title, rows=1000, cols=20)
+        return sheet.add_worksheet(title=title, rows=2000, cols=20)
+
+def _delete_old_bank_tabs(sheet):
+    for bank in BANK_TABS:
+        try:
+            ws = sheet.worksheet(bank)
+            sheet.del_worksheet(ws)
+            print(f"[sheets] Removed old tab: {bank}")
+        except gspread.WorksheetNotFound:
+            pass
 
 def _style_header_row(sheet, worksheet):
-    tab_id = worksheet.id
     requests = [{
         "repeatCell": {
             "range": {
-                "sheetId": tab_id,
+                "sheetId": worksheet.id,
                 "startRowIndex": 0,
                 "endRowIndex": 1,
             },
@@ -66,32 +77,31 @@ def _format_amount(amount):
 
 def read_custom_category_overrides():
     """
-    Reads all Custom Category overrides from existing bank tabs.
-    Returns a dict of {merchant: custom_category} for any non-empty overrides found.
-    Called before sync so overrides can update the merchant cache first.
+    Reads Custom Category overrides from the combined Transactions tab.
+    Any non-empty value in the Custom Category column triggers a permanent
+    cache update and is cleared on next sync.
     """
     from gemini_client import save_user_category, VALID_CATEGORIES
     gc    = _get_client()
     sheet = gc.open_by_key(GOOGLE_SHEET_ID)
 
     overrides = {}
-    for bank in BANK_TABS:
-        try:
-            ws   = sheet.worksheet(bank)
-            rows = ws.get_all_values()
-            if len(rows) < 2:
-                continue
-            for row in rows[1:]:
-                if len(row) >= CUSTOM_CAT_COL:
-                    merchant   = row[1].strip()   # column B
-                    custom_cat = row[CUSTOM_CAT_COL - 1].strip()  # column H
-                    if custom_cat and custom_cat in VALID_CATEGORIES and merchant:
-                        overrides[merchant] = custom_cat
-        except gspread.WorksheetNotFound:
-            continue
+    try:
+        ws   = sheet.worksheet(TXN_TAB)
+        rows = ws.get_all_values()
+        if len(rows) < 2:
+            return overrides
+        for row in rows[1:]:
+            if len(row) >= CUSTOM_CAT_COL:
+                merchant   = row[MERCHANT_COL - 1].strip()   # column C
+                custom_cat = row[CUSTOM_CAT_COL - 1].strip() # column I
+                if custom_cat and custom_cat in VALID_CATEGORIES and merchant:
+                    overrides[merchant] = custom_cat
+    except gspread.WorksheetNotFound:
+        pass
 
     if overrides:
-        print(f"[sheets] Found {len(overrides)} custom category override(s) in sheet")
+        print(f"[sheets] Found {len(overrides)} custom category override(s)")
         for merchant, cat in overrides.items():
             save_user_category(merchant, cat)
             print(f"[sheets] Override applied: '{merchant}' -> '{cat}'")
@@ -99,58 +109,49 @@ def read_custom_category_overrides():
     return overrides
 
 def sync_transactions(transactions, budget_limits):
-    gc     = _get_client()
-    sheet  = gc.open_by_key(GOOGLE_SHEET_ID)
+    gc    = _get_client()
+    sheet = gc.open_by_key(GOOGLE_SHEET_ID)
 
-    # Check for any custom category overrides filled in by user before writing
+    # Pick up any custom category overrides before writing
     read_custom_category_overrides()
 
-    # Group transactions by bank
-    by_bank = {bank: [] for bank in BANK_TABS}
-    for txn in transactions:
-        bank = txn.get("bank")
-        if bank in by_bank:
-            by_bank[bank].append(txn)
+    # Remove old per-bank tabs if they still exist
+    _delete_old_bank_tabs(sheet)
 
-    # Write per-bank tabs
-    for bank, txns in by_bank.items():
-        ws = _get_or_create_tab(sheet, bank)
-        ws.clear()
+    # Write all transactions into one combined tab
+    ws   = _get_or_create_tab(sheet, TXN_TAB)
+    ws.clear()
 
-        rows = [TXN_HEADERS]
-        for t in sorted(txns, key=lambda x: x["date"], reverse=True):
-            status = "Pending" if t["pending"] else "Posted"
-            rows.append([
-                t["date"],
-                t["merchant"],
-                t["category"],
-                _format_amount(t["amount"]),
-                status,
-                t["account_id"],
-                t["transaction_id"],
-                "",   # Custom Category — left blank, filled by user when needed
-            ])
+    rows = [TXN_HEADERS]
+    for t in sorted(transactions, key=lambda x: x["date"], reverse=True):
+        status = "Pending" if t["pending"] else "Posted"
+        rows.append([
+            t["date"],
+            t["bank"],
+            t["merchant"],
+            t["category"],
+            _format_amount(t["amount"]),
+            status,
+            t["account_id"],
+            t["transaction_id"],
+            "",   # Custom Category — fill in to override, picked up on next sync
+        ])
 
-        ws.update(rows, "A1")
-        _style_header_row(sheet, ws)
-        print(f"[sheets] {bank}: {len(txns)} transactions written")
+    ws.update(rows, "A1")
+    _style_header_row(sheet, ws)
+    print(f"[sheets] Transactions: {len(transactions)} rows written ({TXN_TAB} tab)")
 
-    # Write summary tab (posted only, grouped by category)
+    # Summary and timestamp
     _write_summary(sheet, transactions, budget_limits)
-
-    # Update last synced timestamp on summary tab
     _write_last_synced(sheet)
-
     print("[sheets] Sync complete")
 
 def _write_summary(sheet, transactions, budget_limits):
     ws = _get_or_create_tab(sheet, SUMMARY_TAB)
     ws.clear()
 
-    # Only count posted transactions toward budget
     posted = [t for t in transactions if not t["pending"]]
 
-    # Sum by category
     category_totals = {}
     for t in posted:
         cat = t["category"]
@@ -160,18 +161,19 @@ def _write_summary(sheet, transactions, budget_limits):
     all_categories = set(list(budget_limits.keys()) + list(category_totals.keys()))
 
     for cat in sorted(all_categories):
-        spent  = round(category_totals.get(cat, 0), 2)
-        limit  = budget_limits.get(cat, 0)
+        spent     = round(category_totals.get(cat, 0), 2)
+        limit     = budget_limits.get(cat, 0)
         remaining = round(limit - spent, 2) if limit else "N/A"
         pct_used  = f"{round((spent / limit) * 100, 1)}%" if limit else "N/A"
         rows.append([cat, spent, limit if limit else "No limit", remaining, pct_used])
 
-    # Totals row
     total_spent = round(sum(category_totals.values()), 2)
     total_limit = sum(budget_limits.values())
-    rows.append(["TOTAL", total_spent, total_limit,
-                 round(total_limit - total_spent, 2),
-                 f"{round((total_spent / total_limit) * 100, 1)}%" if total_limit else "N/A"])
+    rows.append([
+        "TOTAL", total_spent, total_limit,
+        round(total_limit - total_spent, 2),
+        f"{round((total_spent / total_limit) * 100, 1)}%" if total_limit else "N/A"
+    ])
 
     ws.update(rows, "A1")
     _style_header_row(sheet, ws)
@@ -186,7 +188,7 @@ def sync_subscriptions(recurring_streams):
     rows = [SUBS_HEADERS]
     for stream in recurring_streams:
         rows.append([
-            stream.get("merchant_name", "Unknown"),
+            stream.get("merchant", "Unknown"),
             stream.get("category", "Other"),
             stream.get("frequency", "Unknown"),
             _format_amount(stream.get("last_amount", 0)),
@@ -201,7 +203,9 @@ def sync_subscriptions(recurring_streams):
     print(f"[sheets] Subscriptions: {len(recurring_streams)} streams written")
 
 def _write_last_synced(sheet):
-    ws = _get_or_create_tab(sheet, SUMMARY_TAB)
+    ws       = _get_or_create_tab(sheet, SUMMARY_TAB)
     last_row = len(ws.get_all_values()) + 2
-    ws.update([[f"Last synced: {datetime.now().strftime('%Y-%m-%d %I:%M %p')}"]],
-              f"A{last_row}")
+    ws.update(
+        [[f"Last synced: {datetime.now().strftime('%Y-%m-%d %I:%M %p')}"]],
+        f"A{last_row}"
+    )
