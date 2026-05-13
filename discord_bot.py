@@ -58,7 +58,7 @@ async def run_full_sync(source="manual"):
 
     # 4. Sync year-to-date from DB to Google Sheets
     ytd = transaction_db.get_year_to_date_transactions()
-    sync_transactions(ytd, BUDGET_LIMITS)
+    sync_transactions(ytd, BUDGET_LIMITS, current_month=current_month)
 
     # Fetch and sync recurring/subscriptions
     streams = fetch_all_recurring()
@@ -183,7 +183,8 @@ class RecategorizeSelect(discord.ui.Select):
         transactions = fetch_all_transactions()
         transactions, _ = categorize_transactions(transactions)
         transaction_db.upsert_transactions(transactions)
-        sync_transactions(transaction_db.get_year_to_date_transactions(), BUDGET_LIMITS)
+        ytd = transaction_db.get_year_to_date_transactions()
+        sync_transactions(ytd, BUDGET_LIMITS, current_month=transaction_db.get_current_month_transactions())
 
         channel = bot.get_channel(DISCORD_CHANNEL_ID)
         if channel:
