@@ -36,6 +36,11 @@ bot     = commands.Bot(command_prefix="!", intents=intents)
 # Core sync pipeline — used by both scheduled and manual syncs
 # ---------------------------------------------------------------------------
 
+def _progress_bar(pct, label, width=20):
+    filled = int(width * pct / 100)
+    bar    = "█" * filled + "░" * (width - filled)
+    return f"`[{bar}]` **{pct}%** — {label}"
+
 async def run_full_sync(source="manual"):
     digest_channel = bot.get_channel(DISCORD_CHANNEL_ID)
     alert_channel  = bot.get_channel(DISCORD_ALERT_CHANNEL_ID)
@@ -44,36 +49,43 @@ async def run_full_sync(source="manual"):
         print("[bot] Warning: digest channel not found")
         return
 
-    await digest_channel.send(f"🔄 Syncing transactions from all banks ({source})...")
+    msg = await digest_channel.send(
+        f"**BudgetTrackerAI Sync** ({source})\n{_progress_bar(0, 'Fetching transactions from Plaid...')}"
+    )
 
     # 1. Fetch from Plaid
     transactions = fetch_all_transactions()
+    await msg.edit(content=f"**BudgetTrackerAI Sync** ({source})\n{_progress_bar(20, 'Categorizing with Gemini...')}")
 
     # 2. Gemini categorization
     transactions, uncertain = categorize_transactions(transactions)
+    await msg.edit(content=f"**BudgetTrackerAI Sync** ({source})\n{_progress_bar(40, 'Saving to database...')}")
 
     # 3. Persist to SQLite and purge anything older than 2 years
     transaction_db.upsert_transactions(transactions)
     transaction_db.purge_old_transactions(730)
+    await msg.edit(content=f"**BudgetTrackerAI Sync** ({source})\n{_progress_bar(55, 'Updating Google Sheets...')}")
 
     # 4. Sync year-to-date from DB to Google Sheets
-    ytd = transaction_db.get_year_to_date_transactions()
+    current_month = transaction_db.get_current_month_transactions()
+    ytd           = transaction_db.get_year_to_date_transactions()
     sync_transactions(ytd, BUDGET_LIMITS, current_month=current_month)
+    await msg.edit(content=f"**BudgetTrackerAI Sync** ({source})\n{_progress_bar(70, 'Syncing subscriptions...')}")
 
     # Fetch and sync recurring/subscriptions
     streams = fetch_all_recurring()
     if streams:
         sync_subscriptions(streams)
+    await msg.edit(content=f"**BudgetTrackerAI Sync** ({source})\n{_progress_bar(85, 'Checking budget alerts...')}")
 
     # 5. Budget overage alerts — current month only
-    current_month = transaction_db.get_current_month_transactions()
     overages = check_budget_overages(current_month)
     for overage in overages:
-        msg = generate_overage_message(overage)
-        target = alert_channel or digest_channel
+        alert_msg = generate_overage_message(overage)
+        target    = alert_channel or digest_channel
         await target.send(
             f"**Budget Alert — {overage['category']}**\n"
-            f"{msg}\n"
+            f"{alert_msg}\n"
             f"> Spent: **${overage['spent']}** / Limit: **${overage['limit']}** "
             f"(${overage['over_by']} over · {overage['pct_used']}% used)"
         )
@@ -92,15 +104,17 @@ async def run_full_sync(source="manual"):
             f"> Threshold: ${txn['threshold']}"
         )
 
-    # 6. Prompt user to review uncertain merchants in the review channel
+    # 7. Prompt user to review uncertain merchants in the review channel
     if uncertain:
         review_channel = bot.get_channel(DISCORD_REVIEW_CHANNEL_ID) or digest_channel
         await send_uncertain_prompts(review_channel, uncertain)
 
     posted  = sum(1 for t in transactions if not t["pending"])
     pending = sum(1 for t in transactions if t["pending"])
-    await digest_channel.send(
-        f"✅ Sync complete — **{posted}** posted, **{pending}** pending transactions."
+    await msg.edit(content=
+        f"**BudgetTrackerAI Sync** ({source})\n"
+        f"{_progress_bar(100, 'Done!')}\n"
+        f"✅ **{posted}** posted · **{pending}** pending transactions synced."
     )
 
 async def send_uncertain_prompts(channel, uncertain):
