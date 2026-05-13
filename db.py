@@ -1,4 +1,5 @@
 import sqlite3
+import calendar
 from datetime import datetime, timedelta
 
 DB_FILE = "transactions.db"
@@ -81,9 +82,10 @@ def get_transactions(start_date=None, end_date=None):
     return [_to_dict(r) for r in rows]
 
 def get_current_month_transactions():
-    today = datetime.today()
-    start = today.replace(day=1).strftime("%Y-%m-%d")
-    end   = today.strftime("%Y-%m-%d")
+    today    = datetime.today()
+    start    = today.replace(day=1).strftime("%Y-%m-%d")
+    last_day = calendar.monthrange(today.year, today.month)[1]
+    end      = today.replace(day=last_day).strftime("%Y-%m-%d")
     return get_transactions(start_date=start, end_date=end)
 
 def get_year_to_date_transactions():
