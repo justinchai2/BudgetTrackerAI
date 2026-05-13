@@ -16,6 +16,7 @@ from plaid_client import fetch_all_transactions, fetch_all_recurring
 from sheets_client import sync_transactions, sync_subscriptions, read_custom_category_overrides
 import db as transaction_db
 from budget_engine import check_budget_overages, check_large_transactions, get_budget_summary
+import annual as annual_mgr
 from gemini_client import (
     categorize_transactions, generate_budget_summary, generate_subscription_summary,
     generate_overage_message, get_pending_uncertain, save_user_category,
@@ -312,6 +313,56 @@ async def merchant_autocomplete(
         m for m in cache.keys()
         if current.lower() in m.lower()
     ][:25]
+    return [app_commands.Choice(name=m, value=m) for m in matches]
+
+@bot.tree.command(name="annual", description="Mark a merchant's transactions as annual (splits cost across 12 months)")
+@app_commands.describe(
+    action="add or remove",
+    merchant="Merchant name to add or remove"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="add",    value="add"),
+    app_commands.Choice(name="remove", value="remove"),
+    app_commands.Choice(name="list",   value="list"),
+])
+async def annual_cmd(interaction: discord.Interaction, action: str, merchant: str = ""):
+    if action == "list":
+        merchants = annual_mgr.get_merchants()
+        if not merchants:
+            await interaction.response.send_message(
+                "No annual merchants set. Use `/annual add <merchant>` to add one.",
+                ephemeral=True,
+            )
+        else:
+            lines = ["**Annual Merchants (÷12 in budget calculations)**"]
+            for m in sorted(merchants):
+                lines.append(f"> {m}")
+            await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        return
+
+    if not merchant:
+        await interaction.response.send_message("Please provide a merchant name.", ephemeral=True)
+        return
+
+    if action == "add":
+        annual_mgr.add_merchant(merchant)
+        await interaction.response.send_message(
+            f"**{merchant}** marked as annual — its cost will be divided by 12 in budget calculations.",
+            ephemeral=True,
+        )
+    elif action == "remove":
+        annual_mgr.remove_merchant(merchant)
+        await interaction.response.send_message(
+            f"**{merchant}** removed from annual merchants — full amount will now count each month.",
+            ephemeral=True,
+        )
+
+@annual_cmd.autocomplete("merchant")
+async def annual_merchant_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    cache   = _load_cache()
+    matches = [m for m in cache.keys() if current.lower() in m.lower()][:25]
     return [app_commands.Choice(name=m, value=m) for m in matches]
 
 @bot.tree.command(name="add_account", description="Connect a new credit card or bank account")

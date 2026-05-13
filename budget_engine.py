@@ -7,6 +7,7 @@ from config import (
     LARGE_TRANSACTION_GLOBAL_THRESHOLD,
     LARGE_TRANSACTION_BY_CATEGORY,
 )
+from annual import prorated_amount
 
 # Tracks which transaction IDs have already triggered alerts — persisted to disk
 ALERTED_IDS_FILE = "alerted_ids.json"
@@ -30,7 +31,7 @@ def _category_totals(transactions):
     totals = {}
     for t in transactions:
         cat = t["category"]
-        totals[cat] = totals.get(cat, 0) + t["amount"]
+        totals[cat] = totals.get(cat, 0) + prorated_amount(t)
     return {cat: round(total, 2) for cat, total in totals.items()}
 
 def check_budget_overages(transactions):
