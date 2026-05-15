@@ -607,13 +607,31 @@ def upsert_subscriptions(streams: list):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     with _get_conn() as conn:
+        # ── Bulk-fetch existing merchant_ids in one query ─────────────────
+        merchant_names = [s["merchant"] for s in streams]
+        if merchant_names:
+            placeholders = ",".join("?" * len(merchant_names))
+            existing_mc  = conn.execute(
+                f"SELECT merchant, merchant_id FROM merchant_categories "
+                f"WHERE LOWER(merchant) IN ({placeholders})",
+                [m.lower() for m in merchant_names],
+            ).fetchall()
+            id_map = {r["merchant"].lower(): r["merchant_id"]
+                      for r in existing_mc if r["merchant_id"]}
+        else:
+            id_map = {}
+
         rows = []
         for s in streams:
-            freq        = s.get("frequency", "")
-            next_date   = _next_charge(s.get("last_date", ""), freq)
-            days_until  = _days_until(next_date) if next_date else None
-            category    = s.get("category", "Other")
-            merchant_id = _resolve_merchant_id(conn, s["merchant"], category)
+            freq       = s.get("frequency", "")
+            next_date  = _next_charge(s.get("last_date", ""), freq)
+            days_until = _days_until(next_date) if next_date else None
+            category   = s.get("category", "Other")
+            # Use cached id or create a new merchant_categories row on the spot
+            merchant_id = id_map.get(s["merchant"].lower())
+            if not merchant_id:
+                merchant_id = _resolve_merchant_id(conn, s["merchant"], category)
+                id_map[s["merchant"].lower()] = merchant_id
             rows.append({
                 "merchant":          s["merchant"],
                 "merchant_id":       merchant_id,

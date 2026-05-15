@@ -2,6 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 import datetime
+import time
 import threading
 import webbrowser
 from zoneinfo import ZoneInfo
@@ -177,11 +178,15 @@ async def run_full_sync(source="manual"):
         print("[bot] Warning: digest channel not found")
         return
 
+    t_total = time.time()
+    print(f"[sync] ── Starting sync ({source}) ──")
+
     msg = await digest_channel.send(
         f"**BudgetTrackerAI Sync** ({source})\n{_progress_bar(0, 'Checking bank connections...')}"
     )
 
     # 0. Check bank connection health — warn but don't abort
+    t0 = time.time()
     statuses = fetch_all_item_statuses()
     unhealthy = [s for s in statuses if not s["healthy"]]
     if unhealthy:
@@ -194,23 +199,32 @@ async def run_full_sync(source="manual"):
                 f"> {s['error_message']}\n"
                 f"> _You may need to re-link this account using `/add_account`._"
             )
+    print(f"[sync]   health check:      {time.time() - t0:.1f}s")
 
     # 1. Fetch from Plaid
+    t0 = time.time()
     transactions = fetch_all_transactions()
+    print(f"[sync]   plaid fetch:       {time.time() - t0:.1f}s  ({len(transactions)} txns)")
     await msg.edit(content=f"**BudgetTrackerAI Sync** ({source})\n{_progress_bar(20, 'Categorizing with Gemini...')}")
 
     # 2. Gemini categorization
+    t0 = time.time()
     transactions, uncertain = categorize_transactions(transactions)
+    print(f"[sync]   gemini categories: {time.time() - t0:.1f}s")
     await msg.edit(content=f"**BudgetTrackerAI Sync** ({source})\n{_progress_bar(40, 'Saving to database...')}")
 
     # 3. Persist to SQLite, resolve pending→posted duplicates, purge old records
+    t0 = time.time()
     transaction_db.upsert_transactions(transactions)
     transaction_db.resolve_pending_transactions(transactions)
     transaction_db.deduplicate_transactions()
     transaction_db.purge_old_transactions(730)
+    print(f"[sync]   db upsert:         {time.time() - t0:.1f}s")
 
     # 3b. Auto-update subscriptions whose real charge just came in
+    t0 = time.time()
     sub_updates = auto_update_subscriptions_from_transactions()
+    print(f"[sync]   sub auto-update:   {time.time() - t0:.1f}s  ({len(sub_updates)} updated)")
     if sub_updates:
         target = alert_channel or digest_channel
         for u in sub_updates:
@@ -231,14 +245,17 @@ async def run_full_sync(source="manual"):
     await msg.edit(content=f"**BudgetTrackerAI Sync** ({source})\n{_progress_bar(55, 'Updating Google Sheets...')}")
 
     # 4. Sync year-to-date from DB to Google Sheets
+    t0 = time.time()
     current_month = transaction_db.get_current_month_transactions()
     ytd           = transaction_db.get_year_to_date_transactions()
     sync_transactions(ytd, BUDGET_LIMITS, current_month=current_month)
+    print(f"[sync]   sheets txns:       {time.time() - t0:.1f}s")
     await msg.edit(content=f"**BudgetTrackerAI Sync** ({source})\n{_progress_bar(70, 'Syncing subscriptions...')}")
 
     # Detect subscriptions
     # • Already-tracked merchants → upsert + sync as before (re-detection = update)
     # • Brand-new merchants       → stage for user review instead of auto-saving
+    t0 = time.time()
     streams = detect_subscriptions(ytd)
     manual_subs = get_manual_subscriptions()
 
@@ -254,6 +271,7 @@ async def run_full_sync(source="manual"):
     upsert_subscriptions(all_known)
     if all_known:
         sync_subscriptions(all_known)
+    print(f"[sync]   sheets subs:       {time.time() - t0:.1f}s  ({len(all_known)} subs)")
 
     # Stage new candidates for review via interactive dropdown (sent to review channel)
     if new_candidates:
@@ -272,6 +290,7 @@ async def run_full_sync(source="manual"):
     await msg.edit(content=f"**BudgetTrackerAI Sync** ({source})\n{_progress_bar(85, 'Checking budget alerts...')}")
 
     # 5. Budget overage alerts — current month only
+    t0 = time.time()
     overages = check_budget_overages(current_month)
     for overage in overages:
         try:
@@ -300,6 +319,7 @@ async def run_full_sync(source="manual"):
             f"> Date: {txn['date']}\n"
             f"> Threshold: ${txn['threshold']}"
         )
+    print(f"[sync]   budget alerts:     {time.time() - t0:.1f}s")
 
     # 7. Prompt user to review uncertain merchants in the review channel
     if uncertain:
@@ -308,6 +328,8 @@ async def run_full_sync(source="manual"):
 
     posted  = sum(1 for t in transactions if not t["pending"])
     pending = sum(1 for t in transactions if t["pending"])
+    total_elapsed = time.time() - t_total
+    print(f"[sync] ── Done in {total_elapsed:.1f}s ──")
     await msg.edit(content=
         f"**BudgetTrackerAI Sync** ({source})\n"
         f"{_progress_bar(100, 'Done!')}\n"

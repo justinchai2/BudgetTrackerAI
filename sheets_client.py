@@ -1,7 +1,55 @@
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
+import hashlib
+import json
+import os
 from config import GOOGLE_SERVICE_ACCOUNT_FILE, GOOGLE_SHEET_ID
+
+# ── Sync-state cache ──────────────────────────────────────────────────────────
+# Stores MD5 fingerprints of the last data written to each Sheets tab.
+# If the fingerprint matches on the next sync, we skip the expensive rewrite.
+# Persisted to disk so the cache survives bot restarts.
+
+_SYNC_STATE_FILE = "sheets_sync_state.json"
+_sync_state: dict = {}
+
+def _load_sync_state() -> dict:
+    global _sync_state
+    if not _sync_state:
+        try:
+            with open(_SYNC_STATE_FILE) as f:
+                _sync_state = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            _sync_state = {}
+    return _sync_state
+
+def _save_sync_state() -> None:
+    with open(_SYNC_STATE_FILE, "w") as f:
+        json.dump(_sync_state, f)
+
+def _hash_transactions(transactions: list) -> str:
+    """Fingerprint a transaction list by (id, category, amount, pending)."""
+    key = sorted(
+        (t["transaction_id"], t["category"], float(t["amount"]), bool(t["pending"]))
+        for t in transactions
+    )
+    return hashlib.md5(json.dumps(key).encode()).hexdigest()
+
+def _hash_subscriptions(streams: list) -> str:
+    """Fingerprint a subscription list by all user-visible fields."""
+    key = sorted(
+        (
+            s.get("merchant", ""),
+            s.get("frequency", ""),
+            float(s.get("last_amount") or 0),
+            s.get("next_charge_date", ""),
+            s.get("category", ""),
+            s.get("tag", ""),
+        )
+        for s in streams
+    )
+    return hashlib.md5(json.dumps(key).encode()).hexdigest()
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -164,52 +212,69 @@ def get_transaction_from_sheets(transaction_id: str) -> dict | None:
 
 
 def sync_transactions(transactions, budget_limits, current_month=None):
-    gc    = _get_client()
-    sheet = gc.open_by_key(GOOGLE_SHEET_ID)
+    import time as _time
+    state    = _load_sync_state()
+    txn_hash = _hash_transactions(transactions)
+    gc       = _get_client()
+    sheet    = gc.open_by_key(GOOGLE_SHEET_ID)
 
     _delete_old_bank_tabs(sheet)
 
-    ws   = _get_or_create_tab(sheet, TXN_TAB)
-    ws.clear()
-    _clear_all_formatting(sheet, ws)
+    if state.get("txn_hash") == txn_hash:
+        # Nothing changed — skip the expensive rewrite of all three tabs
+        print(f"[sheets] Transactions: unchanged ({len(transactions)} txns), skipping rewrite")
+    else:
+        t0 = _time.time()
+        ws   = _get_or_create_tab(sheet, TXN_TAB)
+        ws.clear()
+        _clear_all_formatting(sheet, ws)
 
-    rows             = [TXN_HEADERS]
-    separator_rows   = []   # 0-indexed row numbers of month separators
-    current_month_grp = None
-    num_cols         = len(TXN_HEADERS)
+        rows              = [TXN_HEADERS]
+        separator_rows    = []
+        current_month_grp = None
+        num_cols          = len(TXN_HEADERS)
 
-    for t in sorted(transactions, key=lambda x: x["date"], reverse=True):
-        month = t["date"][:7]  # "2026-05"
-        if month != current_month_grp:
-            current_month_grp = month
-            label = datetime.strptime(month, "%Y-%m").strftime("%B %Y")
-            separator_rows.append(len(rows))  # record 0-indexed position
-            rows.append([f"── {label} ──"] + [""] * (num_cols - 1))
+        for t in sorted(transactions, key=lambda x: x["date"], reverse=True):
+            month = t["date"][:7]
+            if month != current_month_grp:
+                current_month_grp = month
+                label = datetime.strptime(month, "%Y-%m").strftime("%B %Y")
+                separator_rows.append(len(rows))
+                rows.append([f"── {label} ──"] + [""] * (num_cols - 1))
 
-        status = "Pending" if t["pending"] else "Posted"
-        rows.append([
-            t["date"],
-            t["bank"],
-            t["merchant"],
-            t["category"],
-            _format_amount(t["amount"]),
-            status,
-            f"...{t['account_mask']}" if t.get("account_mask") else "",
-            t.get("payment_channel", ""),
-            t.get("website", ""),
-            t.get("location", ""),
-            t.get("plaid_category", ""),
-            t["transaction_id"],
-        ])
+            status = "Pending" if t["pending"] else "Posted"
+            rows.append([
+                t["date"],
+                t["bank"],
+                t["merchant"],
+                t["category"],
+                _format_amount(t["amount"]),
+                status,
+                f"...{t['account_mask']}" if t.get("account_mask") else "",
+                t.get("payment_channel", ""),
+                t.get("website", ""),
+                t.get("location", ""),
+                t.get("plaid_category", ""),
+                t["transaction_id"],
+            ])
 
-    ws.update(rows, "A1")
-    _style_header_row(sheet, ws)
-    _style_month_separators(sheet, ws, separator_rows)
-    print(f"[sheets] Transactions: {len(transactions)} rows written ({TXN_TAB} tab)")
+        ws.update(rows, "A1")
+        _style_header_row(sheet, ws)
+        _style_month_separators(sheet, ws, separator_rows)
+        print(f"[sheets] Transactions tab: {len(transactions)} rows written ({_time.time()-t0:.1f}s)")
 
-    _write_monthly_tab(sheet, current_month or [], budget_limits)
-    _write_ytd_tab(sheet, transactions, budget_limits)
-    print("[sheets] Sync complete")
+        t0 = _time.time()
+        _write_monthly_tab(sheet, current_month or [], budget_limits)
+        print(f"[sheets] Monthly tab: written ({_time.time()-t0:.1f}s)")
+
+        t0 = _time.time()
+        _write_ytd_tab(sheet, transactions, budget_limits)
+        print(f"[sheets] YTD tab: written ({_time.time()-t0:.1f}s)")
+
+        state["txn_hash"] = txn_hash
+        _save_sync_state()
+
+    print("[sheets] Transactions sync complete")
 
 def _category_totals_for_summary(transactions, budget_limits):
     from annual import prorated_amount
@@ -643,6 +708,12 @@ def _style_subscription_rows(sheet, worksheet, annual_row_indices: list,
 
 
 def sync_subscriptions(recurring_streams):
+    state    = _load_sync_state()
+    sub_hash = _hash_subscriptions(recurring_streams)
+    if state.get("sub_hash") == sub_hash:
+        print(f"[sheets] Subscriptions: unchanged ({len(recurring_streams)} subs), skipping rewrite")
+        return
+
     gc    = _get_client()
     sheet = gc.open_by_key(GOOGLE_SHEET_ID)
     ws    = _get_or_create_tab(sheet, SUBS_TAB)
@@ -725,5 +796,7 @@ def sync_subscriptions(recurring_streams):
             }
         }]})
 
+    state["sub_hash"] = sub_hash
+    _save_sync_state()
     print(f"[sheets] Subscriptions: {len(recurring_streams)} streams written")
 
