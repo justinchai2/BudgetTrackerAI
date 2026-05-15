@@ -83,11 +83,20 @@ LINK_PAGE = """<!DOCTYPE html>
   var handler = Plaid.create({{
     token: "{link_token}",
     onSuccess: function(public_token, metadata) {{
-      window.location = "/callback?public_token=" + public_token
+      var base = "{ngrok_base}" || window.location.origin;
+      window.location = base + "/callback?public_token=" + public_token
         + "&institution=" + encodeURIComponent(metadata.institution.name);
     }},
-    onExit: function(err) {{
-      document.body.innerHTML = "<h2>Cancelled.</h2><p>Close this window and try again.</p>";
+    onExit: function(err, metadata) {{
+      var msg = "<h2>Exited Plaid Link</h2>";
+      if (err) {{
+        msg += "<p><b>Error:</b> " + JSON.stringify(err) + "</p>";
+      }}
+      if (metadata) {{
+        msg += "<p><b>Metadata:</b> " + JSON.stringify(metadata) + "</p>";
+      }}
+      msg += "<p>Close this window and try again.</p>";
+      document.body.innerHTML = msg;
     }}
   }});
   handler.open();
@@ -112,8 +121,16 @@ OAUTH_RETURN_PAGE = """<!DOCTYPE html>
       window.location = "http://localhost:{port}/callback?public_token=" + public_token
         + "&institution=" + encodeURIComponent(metadata.institution.name);
     }},
-    onExit: function(err) {{
-      document.body.innerHTML = "<h2>Cancelled.</h2><p>Close this window and try again.</p>";
+    onExit: function(err, metadata) {{
+      var msg = "<h2>Exited Plaid Link (OAuth return)</h2>";
+      if (err) {{
+        msg += "<p><b>Error:</b> " + JSON.stringify(err) + "</p>";
+      }}
+      if (metadata) {{
+        msg += "<p><b>Metadata:</b> " + JSON.stringify(metadata) + "</p>";
+      }}
+      msg += "<p>Close this window and try again.</p>";
+      document.body.innerHTML = msg;
     }}
   }});
   handler.open();
@@ -128,7 +145,10 @@ class CallbackHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/":
             _current_link_token = create_link_token()
-            html = LINK_PAGE.format(link_token=_current_link_token)
+            html = LINK_PAGE.format(
+                link_token=_current_link_token,
+                ngrok_base=NGROK_BASE or "",
+            )
             self._respond(200, html)
 
         elif parsed.path == "/oauth-return":
@@ -208,7 +228,8 @@ def main():
     print("A browser window will open. Connect any bank Plaid supports.")
     print("Run this script once per bank. The access token prints here and in the browser.\n")
 
-    webbrowser.open(f"http://localhost:{CALLBACK_PORT}/")
+    start_url = f"{NGROK_BASE}/" if NGROK_BASE else f"http://localhost:{CALLBACK_PORT}/"
+    webbrowser.open(start_url)
     server = HTTPServer(("localhost", CALLBACK_PORT), CallbackHandler)
     server.serve_forever()
 

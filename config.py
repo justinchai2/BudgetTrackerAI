@@ -47,12 +47,23 @@ DISCORD_GUILD_ID          = _safe_int(os.getenv("DISCORD_GUILD_ID"))
 # Common US options: America/New_York, America/Chicago, America/Denver, America/Los_Angeles
 TIMEZONE = "America/New_York"
 
-# Sync schedule — twice daily: 9am and 9pm pulls, morning digest at 10am
+# Sync schedule — twice daily: 9am and 9pm pulls
 SYNC_HOURS = [9, 21]
-DIGEST_HOUR = 10
+
+# Daily digest schedule
+DIGEST_MORNING_HOUR   = 9    # 9:00 AM — budget overview for the day
+DIGEST_EVENING_HOUR   = 23   # 11:59 PM — end-of-day spending recap
+DIGEST_EVENING_MINUTE = 59
+
+# Subscription reminder — hour to send the daily upcoming-charge alert (9am)
+SUBSCRIPTION_REMINDER_HOUR = 9
 
 # How many days back to pull transactions on each sync
 TRANSACTION_LOOKBACK_DAYS = 132  # from Jan 1 2026
+
+# Plaid webhook server
+WEBHOOK_PORT = _safe_int(os.getenv("WEBHOOK_PORT"), 3000)
+PLAID_WEBHOOK_SECRET = os.getenv("PLAID_WEBHOOK_SECRET", "")
 
 # Pending transactions: show in Sheet but exclude from budget calculations and alerts
 COUNT_PENDING = False
@@ -61,14 +72,14 @@ COUNT_PENDING = False
 # Edit these to match your actual spending limits
 BUDGET_LIMITS = {
     "Food and Drink":       600,
-    "Groceries":            400,
-    "Travel":               500,
-    "Entertainment":        200,
+    "Groceries":            500,
+    "Travel":               800,
+    "Entertainment":        300,
     "Shopping":             300,
-    "Health and Fitness":   150,
-    "Gas":                  200,
-    "Necessities":            250,
-    "Other":                300,
+    "Health and Fitness":   250,
+    "Gas":                  150,
+    "Necessities":          1250,
+    "Other":                500,
 }
 
 # Large transaction alerts (Option C: global threshold + per-category overrides)

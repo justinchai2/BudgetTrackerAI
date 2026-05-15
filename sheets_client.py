@@ -8,27 +8,28 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-BANK_TABS       = ["Chase", "Citi", "Capital One"]  # old tabs to remove if present
-TXN_TAB         = "Transactions"
-SUMMARY_TAB     = "Summary"
-SUBS_TAB        = "Subscriptions"
+BANK_TABS    = ["Chase", "Citi", "Capital One"]  # old tabs to remove if present
+TXN_TAB      = "Transactions"
+MONTHLY_TAB  = "Monthly"
+YTD_TAB      = "Year to Date"
+SUBS_TAB     = "Subscriptions"
 
 TXN_HEADERS = [
     "Date", "Bank", "Merchant", "Category", "Amount",
-    "Status", "Account ID", "Transaction ID", "Custom Category"
+    "Status", "Account (Last 4)", "Payment Channel", "Website", "Location", "Plaid Category", "Transaction ID"
 ]
 
 # Column indices (1-indexed)
-MERCHANT_COL   = 3   # column C
-CUSTOM_CAT_COL = 9   # column I
+MERCHANT_COL = 3   # column C
 
 SUMMARY_HEADERS = [
     "Category", "Total Spent", "Budget Limit", "Remaining", "% Used"
 ]
 
 SUBS_HEADERS = [
-    "Merchant", "Category", "Frequency", "Last Amount", "Average Amount",
-    "Last Date", "Status", "Bank"
+    "Merchant", "Tag", "Category", "Type", "Billing Cycle", "Frequency",
+    "Charge Amount", "Est. Monthly", "Annual Total",
+    "Next Charge", "Days Away", "First Seen", "Last Seen", "Bank", "Source"
 ]
 
 def _get_client():
@@ -49,6 +50,15 @@ def _delete_old_bank_tabs(sheet):
             print(f"[sheets] Removed old tab: {bank}")
         except gspread.WorksheetNotFound:
             pass
+
+def _clear_all_formatting(sheet, worksheet):
+    """Wipe all cell formatting on a sheet before re-writing it."""
+    sheet.batch_update({"requests": [{
+        "updateCells": {
+            "range":  {"sheetId": worksheet.id},
+            "fields": "userEnteredFormat",
+        }
+    }]})
 
 def _style_header_row(sheet, worksheet):
     requests = [{
@@ -75,51 +85,58 @@ def _style_header_row(sheet, worksheet):
 def _format_amount(amount):
     return round(float(amount), 2)
 
-def read_custom_category_overrides():
-    """
-    Reads Custom Category overrides from the combined Transactions tab.
-    Any non-empty value in the Custom Category column triggers a permanent
-    cache update and is cleared on next sync.
-    """
-    from gemini_client import save_user_category, VALID_CATEGORIES
-    gc    = _get_client()
-    sheet = gc.open_by_key(GOOGLE_SHEET_ID)
-
-    overrides = {}
-    try:
-        ws   = sheet.worksheet(TXN_TAB)
-        rows = ws.get_all_values()
-        if len(rows) < 2:
-            return overrides
-        for row in rows[1:]:
-            if len(row) >= CUSTOM_CAT_COL:
-                merchant   = row[MERCHANT_COL - 1].strip()   # column C
-                custom_cat = row[CUSTOM_CAT_COL - 1].strip() # column I
-                if custom_cat and custom_cat in VALID_CATEGORIES and merchant:
-                    overrides[merchant] = custom_cat
-    except gspread.WorksheetNotFound:
-        pass
-
-    if overrides:
-        print(f"[sheets] Found {len(overrides)} custom category override(s)")
-        for merchant, cat in overrides.items():
-            save_user_category(merchant, cat)
-            print(f"[sheets] Override applied: '{merchant}' -> '{cat}'")
-
-    return overrides
+def _style_month_separators(sheet, worksheet, separator_row_indices):
+    """Apply a teal separator style to month header rows (0-indexed)."""
+    if not separator_row_indices:
+        return
+    requests = [
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId":       worksheet.id,
+                    "startRowIndex": row_idx,
+                    "endRowIndex":   row_idx + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 0.18, "green": 0.45, "blue": 0.55},
+                        "textFormat": {
+                            "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0},
+                            "bold": True,
+                            "fontSize": 10,
+                        },
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat)",
+            }
+        }
+        for row_idx in separator_row_indices
+    ]
+    sheet.batch_update({"requests": requests})
 
 def sync_transactions(transactions, budget_limits, current_month=None):
     gc    = _get_client()
     sheet = gc.open_by_key(GOOGLE_SHEET_ID)
 
-    read_custom_category_overrides()
     _delete_old_bank_tabs(sheet)
 
     ws   = _get_or_create_tab(sheet, TXN_TAB)
     ws.clear()
+    _clear_all_formatting(sheet, ws)
 
-    rows = [TXN_HEADERS]
+    rows             = [TXN_HEADERS]
+    separator_rows   = []   # 0-indexed row numbers of month separators
+    current_month_grp = None
+    num_cols         = len(TXN_HEADERS)
+
     for t in sorted(transactions, key=lambda x: x["date"], reverse=True):
+        month = t["date"][:7]  # "2026-05"
+        if month != current_month_grp:
+            current_month_grp = month
+            label = datetime.strptime(month, "%Y-%m").strftime("%B %Y")
+            separator_rows.append(len(rows))  # record 0-indexed position
+            rows.append([f"── {label} ──"] + [""] * (num_cols - 1))
+
         status = "Pending" if t["pending"] else "Posted"
         rows.append([
             t["date"],
@@ -128,17 +145,21 @@ def sync_transactions(transactions, budget_limits, current_month=None):
             t["category"],
             _format_amount(t["amount"]),
             status,
-            t["account_id"],
+            f"...{t['account_mask']}" if t.get("account_mask") else "",
+            t.get("payment_channel", ""),
+            t.get("website", ""),
+            t.get("location", ""),
+            t.get("plaid_category", ""),
             t["transaction_id"],
-            "",
         ])
 
     ws.update(rows, "A1")
     _style_header_row(sheet, ws)
+    _style_month_separators(sheet, ws, separator_rows)
     print(f"[sheets] Transactions: {len(transactions)} rows written ({TXN_TAB} tab)")
 
-    _write_summary(sheet, transactions, budget_limits, current_month or [])
-    _write_last_synced(sheet)
+    _write_monthly_tab(sheet, current_month or [], budget_limits)
+    _write_ytd_tab(sheet, transactions, budget_limits)
     print("[sheets] Sync complete")
 
 def _category_totals_for_summary(transactions, budget_limits):
@@ -150,6 +171,7 @@ def _category_totals_for_summary(transactions, budget_limits):
         totals[cat] = totals.get(cat, 0) + prorated_amount(t)
     all_cats = (set(budget_limits.keys()) | set(totals.keys())) - {"Excluded"}
     return totals, sorted(all_cats)
+
 
 def _build_budget_table(transactions, budget_limits):
     totals, cats = _category_totals_for_summary(transactions, budget_limits)
@@ -169,43 +191,302 @@ def _build_budget_table(transactions, budget_limits):
     ])
     return rows, len(cats)  # rows, number of data rows (excluding header + TOTAL)
 
-def _write_summary(sheet, ytd_transactions, budget_limits, monthly_transactions):
+def _build_monthly_breakdown(ytd_transactions, budget_limits):
+    """Builds a month-by-month spending table for the YTD tab."""
+    from annual import prorated_amount
+    from collections import defaultdict
+
+    monthly_data = defaultdict(lambda: defaultdict(float))
+    for t in ytd_transactions:
+        if not t["pending"] and t["category"] != "Excluded":
+            month = t["date"][:7]  # "2026-01"
+            monthly_data[month][t["category"]] += prorated_amount(t)
+
+    sorted_months = sorted(monthly_data.keys())
+    categories    = sorted(budget_limits.keys())
+
+    headers = ["Month"] + categories + ["Total"]
+    rows    = [headers]
+    for month in sorted_months:
+        label = datetime.strptime(month, "%Y-%m").strftime("%b %Y")
+        row   = [label]
+        total = 0
+        for cat in categories:
+            amt = round(monthly_data[month].get(cat, 0), 2)
+            row.append(amt)
+            total += amt
+        row.append(round(total, 2))
+        rows.append(row)
+
+    return rows
+
+def _refresh_chart(sheet, spreadsheet_id, ws, data_start, data_end, title):
+    """Delete all existing charts on this sheet and add a single pie chart."""
+    try:
+        resp = sheet.client.request(
+            "GET",
+            f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}",
+            params={"fields": "sheets(properties.sheetId,charts.chartId)"},
+        )
+        delete_requests = [
+            {"deleteEmbeddedObject": {"objectId": c["chartId"]}}
+            for s in resp.json().get("sheets", [])
+            if s.get("properties", {}).get("sheetId") == ws.id
+            for c in s.get("charts", [])
+        ]
+    except Exception as e:
+        print(f"[sheets] Warning: could not fetch chart IDs: {e}")
+        delete_requests = []
+
+    add_request = {
+        "addChart": {
+            "chart": {
+                "spec": {
+                    "title": title,
+                    "pieChart": {
+                        "legendPosition": "RIGHT_LEGEND",
+                        "domain": {
+                            "sourceRange": {"sources": [{
+                                "sheetId":          ws.id,
+                                "startRowIndex":    data_start,
+                                "endRowIndex":      data_end,
+                                "startColumnIndex": 0,
+                                "endColumnIndex":   1,
+                            }]}
+                        },
+                        "series": {
+                            "sourceRange": {"sources": [{
+                                "sheetId":          ws.id,
+                                "startRowIndex":    data_start,
+                                "endRowIndex":      data_end,
+                                "startColumnIndex": 1,
+                                "endColumnIndex":   2,
+                            }]}
+                        },
+                        "threeDimensional": False,
+                    }
+                },
+                "position": {
+                    "overlayPosition": {
+                        "anchorCell": {
+                            "sheetId":     ws.id,
+                            "rowIndex":    1,
+                            "columnIndex": 6,
+                        },
+                        "widthPixels":  480,
+                        "heightPixels": 360,
+                    }
+                }
+            }
+        }
+    }
+
+    all_requests = delete_requests + [add_request]
+    if all_requests:
+        sheet.batch_update({"requests": all_requests})
+
+def _refresh_bar_chart(sheet, spreadsheet_id, ws, data_start, data_end, title):
+    """
+    Delete all existing charts on this sheet and add a horizontal grouped bar chart
+    showing Spent (col B) vs Budget Limit (col C) per category.
+    """
+    try:
+        resp = sheet.client.request(
+            "GET",
+            f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}",
+            params={"fields": "sheets(properties.sheetId,charts.chartId)"},
+        )
+        delete_requests = [
+            {"deleteEmbeddedObject": {"objectId": c["chartId"]}}
+            for s in resp.json().get("sheets", [])
+            if s.get("properties", {}).get("sheetId") == ws.id
+            for c in s.get("charts", [])
+        ]
+    except Exception as e:
+        print(f"[sheets] Warning: could not fetch chart IDs: {e}")
+        delete_requests = []
+
+    def _src(col_start, col_end):
+        return {"sourceRange": {"sources": [{
+            "sheetId":          ws.id,
+            "startRowIndex":    data_start,
+            "endRowIndex":      data_end,
+            "startColumnIndex": col_start,
+            "endColumnIndex":   col_end,
+        }]}}
+
+    add_request = {
+        "addChart": {
+            "chart": {
+                "spec": {
+                    "title": title,
+                    "basicChart": {
+                        "chartType":      "BAR",
+                        "legendPosition": "BOTTOM_LEGEND",
+                        "axis": [
+                            {"position": "BOTTOM_AXIS", "title": "Amount ($)"},
+                            {"position": "LEFT_AXIS",   "title": "Category"},
+                        ],
+                        "domains": [{"domain": _src(0, 1)}],
+                        "series": [
+                            {
+                                "series":     _src(1, 2),   # Total Spent
+                                "targetAxis": "BOTTOM_AXIS",
+                                "color":      {"red": 0.29, "green": 0.53, "blue": 0.91},
+                            },
+                            {
+                                "series":     _src(2, 3),   # Budget Limit
+                                "targetAxis": "BOTTOM_AXIS",
+                                "color":      {"red": 0.78, "green": 0.78, "blue": 0.78},
+                            },
+                        ],
+                        "headerCount": 1,
+                    },
+                },
+                "position": {
+                    "overlayPosition": {
+                        "anchorCell": {
+                            "sheetId":     ws.id,
+                            "rowIndex":    1,
+                            "columnIndex": 6,
+                        },
+                        "widthPixels":  560,
+                        "heightPixels": 400,
+                    }
+                },
+            }
+        }
+    }
+
+    all_requests = delete_requests + [add_request]
+    if all_requests:
+        sheet.batch_update({"requests": all_requests})
+
+def _build_pending_section(monthly_transactions):
+    """Returns rows for a pending-transactions summary block."""
+    pending = [t for t in monthly_transactions if t["pending"]]
+    if not pending:
+        return None, 0.0
+
+    by_category = {}
+    for t in pending:
+        cat = t["category"]
+        by_category[cat] = by_category.get(cat, 0.0) + float(t["amount"])
+
+    rows = [["Pending Transactions", "Amount"]]
+    for cat in sorted(by_category):
+        rows.append([cat, round(by_category[cat], 2)])
+    total = round(sum(by_category.values()), 2)
+    rows.append(["TOTAL PENDING", total])
+    return rows, total
+
+
+def _style_pending_section(sheet, worksheet, header_row_idx, total_row_idx):
+    """Style the pending section header (orange) and total row (bold)."""
+    requests = [
+        # Section header row — orange background
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId":       worksheet.id,
+                    "startRowIndex": header_row_idx,
+                    "endRowIndex":   header_row_idx + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 0.95, "green": 0.60, "blue": 0.20},
+                        "textFormat": {
+                            "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0},
+                            "bold": True,
+                        },
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat)",
+            }
+        },
+        # TOTAL PENDING row — bold
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId":       worksheet.id,
+                    "startRowIndex": total_row_idx,
+                    "endRowIndex":   total_row_idx + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "textFormat": {"bold": True},
+                    }
+                },
+                "fields": "userEnteredFormat(textFormat)",
+            }
+        },
+    ]
+    sheet.batch_update({"requests": requests})
+
+
+def _write_monthly_tab(sheet, monthly_transactions, budget_limits):
     from config import GOOGLE_SHEET_ID
-    from datetime import datetime
-    ws = _get_or_create_tab(sheet, SUMMARY_TAB)
+    ws          = _get_or_create_tab(sheet, MONTHLY_TAB)
     ws.clear()
+    _clear_all_formatting(sheet, ws)
+    month_label = datetime.now().strftime("%B %Y")
 
-    now         = datetime.now()
-    month_label = now.strftime("%B %Y")
-    year_label  = str(now.year)
-
-    # --- Monthly table ---
-    monthly_table, monthly_n = _build_budget_table(monthly_transactions, budget_limits)
-    monthly_section = [[f"=== This Month — {month_label} ===", "", "", "", ""]] + monthly_table
-    ws.update(monthly_section, "A1")
+    table, n = _build_budget_table(monthly_transactions, budget_limits)
+    section  = [[f"=== This Month — {month_label} ===", "", "", "", ""]] + table
+    ws.update(section, "A1")
     _style_header_row(sheet, ws)
 
-    # monthly_section layout (0-indexed rows in sheet):
-    #   0: section label
-    #   1: column headers
-    #   2 .. 2+monthly_n-1: category data rows
-    #   2+monthly_n: TOTAL row
-    monthly_data_start_0 = 2
-    monthly_data_end_0   = 2 + monthly_n  # exclusive
+    # Horizontal bar chart — category rows start at index 2 (skip section label + header)
+    # Exclude the TOTAL row from the chart (data_end = 2 + n, not 2 + n + 1)
+    _refresh_bar_chart(
+        sheet, GOOGLE_SHEET_ID, ws,
+        data_start=2, data_end=2 + n,
+        title=f"Spent vs Budget — {month_label}",
+    )
 
-    # --- YTD table ---
-    ytd_table, ytd_n = _build_budget_table(ytd_transactions, budget_limits)
-    ytd_section       = [[f"=== Year to Date — {year_label} ===", "", "", "", ""]] + ytd_table
-    ytd_start_1       = len(monthly_section) + 3   # 1-indexed, leave 2 blank rows
-    ws.update(ytd_section, f"A{ytd_start_1}")
+    # --- Pending transactions summary ---
+    pending_rows, pending_total = _build_pending_section(monthly_transactions)
+    if pending_rows:
+        # section = 1 title + 1 header + n cats + 1 TOTAL = n + 3 rows
+        # Leave 2 blank rows before pending block
+        pending_start = len(section) + 3          # 1-indexed row number
+        ws.update(pending_rows, f"A{pending_start}")
 
-    # ytd layout in sheet (0-indexed):
-    #   ytd_start_1-1: section label
-    #   ytd_start_1:   column headers
-    #   ytd_start_1+1 .. ytd_start_1+ytd_n: category data rows
-    ytd_data_start_0 = ytd_start_1      # 0-indexed = ytd_start_1 (after section label + header = +2, but section label is at ytd_start_1-1 so header is at ytd_start_1)
-    ytd_data_start_0 = (ytd_start_1 - 1) + 2   # skip section label + column header
-    ytd_data_end_0   = ytd_data_start_0 + ytd_n
+        # Style: header row and total row (0-indexed for API)
+        pending_header_idx = pending_start - 1           # 0-indexed
+        pending_total_idx  = pending_header_idx + len(pending_rows) - 1
+        _style_pending_section(sheet, ws, pending_header_idx, pending_total_idx)
+        print(f"[sheets] Pending total: ${pending_total} across {len(pending_rows) - 2} categories")
+    else:
+        print("[sheets] No pending transactions this month")
+
+    print(f"[sheets] Monthly tab written ({month_label})")
+
+def _write_ytd_tab(sheet, ytd_transactions, budget_limits):
+    from config import GOOGLE_SHEET_ID
+    ws         = _get_or_create_tab(sheet, YTD_TAB)
+    ws.clear()
+    _clear_all_formatting(sheet, ws)
+    year_label = str(datetime.now().year)
+
+    # --- YTD budget table ---
+    table, n = _build_budget_table(ytd_transactions, budget_limits)
+    section  = [[f"=== Year to Date — {year_label} ===", "", "", "", ""]] + table
+    ws.update(section, "A1")
+    _style_header_row(sheet, ws)
+
+    # Pie chart for YTD — data rows start at index 2
+    _refresh_chart(
+        sheet, GOOGLE_SHEET_ID, ws,
+        data_start=2, data_end=2 + n,
+        title=f"Spending — YTD {year_label}",
+    )
+
+    # --- Month-by-month breakdown ---
+    breakdown       = _build_monthly_breakdown(ytd_transactions, budget_limits)
+    breakdown_start = len(section) + 3   # leave 2 blank rows
+    ws.update([[f"=== Month-by-Month — {year_label} ==="]], f"A{breakdown_start}")
+    ws.update(breakdown, f"A{breakdown_start + 1}")
 
     # --- Bank date ranges ---
     bank_dates = {}
@@ -217,124 +498,183 @@ def _write_summary(sheet, ytd_transactions, budget_limits, monthly_transactions)
             if d < bank_dates[bank]["earliest"]: bank_dates[bank]["earliest"] = d
             if d > bank_dates[bank]["latest"]:   bank_dates[bank]["latest"]   = d
 
-    dates_start_1 = ytd_start_1 + len(ytd_section) + 3
-    date_rows = [["Bank", "Earliest Transaction", "Latest Transaction"]]
+    dates_start = breakdown_start + 1 + len(breakdown) + 3
+    date_rows   = [["Bank", "Earliest Transaction", "Latest Transaction"]]
     for bank in sorted(bank_dates):
         date_rows.append([bank, bank_dates[bank]["earliest"], bank_dates[bank]["latest"]])
-    ws.update(date_rows, f"A{dates_start_1}")
+    ws.update(date_rows, f"A{dates_start}")
 
-    # --- Pie charts ---
-    _refresh_charts(
-        sheet, GOOGLE_SHEET_ID, ws,
-        monthly_data_start_0, monthly_data_end_0, month_label,
-        ytd_data_start_0,     ytd_data_end_0,     year_label,
+    # --- Last synced ---
+    last_row = dates_start + len(date_rows) + 2
+    ws.update(
+        [[f"Last synced: {datetime.now().strftime('%Y-%m-%d %I:%M %p')}"]],
+        f"A{last_row}"
     )
 
-    print(f"[sheets] Summary written (monthly + YTD, {len(bank_dates)} banks)")
+    print(f"[sheets] YTD tab written ({year_label}, {len(bank_dates)} banks)")
 
-def _refresh_charts(sheet, spreadsheet_id, ws,
-                    m_start, m_end, month_label,
-                    y_start, y_end, year_label):
-    """Delete existing charts in the Summary sheet and recreate monthly + YTD pie charts."""
-    # Get existing chart IDs
-    try:
-        resp = sheet.client.request(
-            "GET",
-            f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}",
-            params={"fields": "sheets(properties.sheetId,charts.chartId)"},
-        )
-        delete_requests = []
-        for s in resp.json().get("sheets", []):
-            if s.get("properties", {}).get("sheetId") == ws.id:
-                for c in s.get("charts", []):
-                    delete_requests.append(
-                        {"deleteEmbeddedObject": {"objectId": c["chartId"]}}
-                    )
-    except Exception as e:
-        print(f"[sheets] Warning: could not fetch chart IDs: {e}")
-        delete_requests = []
+def _est_monthly(stream) -> float:
+    """
+    Estimate monthly cost from a detected subscription stream.
+    For variable-amount subscriptions, uses average_amount as the basis.
+    """
+    freq = stream.get("frequency", "")
+    # Variable-amount subs: use average rather than last charge
+    if stream.get("variable_amount"):
+        amt = float(stream.get("average_amount") or stream.get("last_amount") or 0)
+    else:
+        amt = float(stream.get("last_amount") or stream.get("average_amount") or 0)
+    if "Annual"      in freq: return round(amt / 12, 2)
+    if "Semi"        in freq: return round(amt / 6,  2)
+    if "Quarterly"   in freq: return round(amt / 3,  2)
+    if "Bi-Weekly"   in freq: return round(amt * 2.17, 2)
+    if "Weekly"      in freq: return round(amt * 4.33, 2)
+    return round(amt, 2)   # Monthly
 
-    def _pie_req(title, data_start, data_end, anchor_row, anchor_col):
-        return {
-            "addChart": {
-                "chart": {
-                    "spec": {
-                        "title": title,
-                        "pieChart": {
-                            "legendPosition": "RIGHT_LEGEND",
-                            "domain": {
-                                "sourceRange": {"sources": [{
-                                    "sheetId":          ws.id,
-                                    "startRowIndex":    data_start,
-                                    "endRowIndex":      data_end,
-                                    "startColumnIndex": 0,
-                                    "endColumnIndex":   1,
-                                }]}
-                            },
-                            "series": {
-                                "sourceRange": {"sources": [{
-                                    "sheetId":          ws.id,
-                                    "startRowIndex":    data_start,
-                                    "endRowIndex":      data_end,
-                                    "startColumnIndex": 1,
-                                    "endColumnIndex":   2,
-                                }]}
-                            },
-                            "threeDimensional": False,
-                        }
-                    },
-                    "position": {
-                        "overlayPosition": {
-                            "anchorCell": {
-                                "sheetId":     ws.id,
-                                "rowIndex":    anchor_row,
-                                "columnIndex": anchor_col,
-                            },
-                            "widthPixels":  480,
-                            "heightPixels": 360,
-                        }
+
+def _billing_cycle(frequency: str) -> str:
+    """
+    Classify a frequency string into a high-level billing cycle label.
+    Annual / Semi-Annual / Quarterly → their own labels.
+    Everything else → "Monthly" (weekly/bi-weekly/monthly all recur at sub-month cadence).
+    """
+    if "Annual" in frequency:   return "Annual"
+    if "Semi"   in frequency:   return "Semi-Annual"
+    if "Quarterly" in frequency: return "Quarterly"
+    return "Monthly"
+
+
+def _style_subscription_rows(sheet, worksheet, annual_row_indices: list,
+                              monthly_row_indices: list):
+    """
+    Style subscription rows:
+      Annual  → gold background + bold  (stands out clearly)
+      Monthly → soft steel-blue tint    (subtle, just enough to group them)
+    """
+    requests = []
+
+    for row_idx in annual_row_indices:
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId":       worksheet.id,
+                    "startRowIndex": row_idx,
+                    "endRowIndex":   row_idx + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 1.0, "green": 0.84, "blue": 0.0},
+                        "textFormat": {"bold": True},
                     }
-                }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat)",
             }
-        }
+        })
 
-    add_requests = [
-        _pie_req(f"Spending — {month_label}",  m_start, m_end, anchor_row=1,    anchor_col=6),
-        _pie_req(f"Spending — YTD {year_label}", y_start, y_end, anchor_row=22, anchor_col=6),
-    ]
+    for row_idx in monthly_row_indices:
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId":       worksheet.id,
+                    "startRowIndex": row_idx,
+                    "endRowIndex":   row_idx + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        # Muted slate-blue — light enough to not distract
+                        "backgroundColor": {"red": 0.88, "green": 0.92, "blue": 0.97},
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor)",
+            }
+        })
 
-    all_requests = delete_requests + add_requests
-    if all_requests:
-        sheet.batch_update({"requests": all_requests})
-    print("[sheets] Charts refreshed")
+    if requests:
+        sheet.batch_update({"requests": requests})
+
 
 def sync_subscriptions(recurring_streams):
     gc    = _get_client()
     sheet = gc.open_by_key(GOOGLE_SHEET_ID)
     ws    = _get_or_create_tab(sheet, SUBS_TAB)
     ws.clear()
+    _clear_all_formatting(sheet, ws)
 
-    rows = [SUBS_HEADERS]
+    rows          = [SUBS_HEADERS]
+    annual_rows   = []   # 0-indexed row numbers → gold + bold
+    monthly_rows  = []   # 0-indexed row numbers → subtle blue tint
+
     for stream in recurring_streams:
+        sub_type  = (stream.get("sub_type") or "").replace("_", " ").title() or "—"
+        freq      = stream.get("frequency", "Unknown")
+        cycle     = _billing_cycle(freq)
+        is_annual = "Annual" in cycle
+
+        days_until = stream.get("days_until_charge")
+        if days_until is None:
+            days_label = ""
+        elif days_until < 0:
+            days_label = f"Overdue ({abs(days_until)}d ago)"
+        elif days_until == 0:
+            days_label = "Today"
+        else:
+            days_label = f"{days_until}d"
+
+        is_variable = stream.get("variable_amount", False)
+        charge_amt  = "Variable" if is_variable else _format_amount(stream.get("last_amount", 0))
+        monthly_amt = _est_monthly(stream)
+        annual_total = (_format_amount(stream.get("last_amount", 0))
+                        if is_annual else round(monthly_amt * 12, 2))
+
+        row_idx = len(rows)   # 0-indexed position of the row about to be appended
+        if is_annual:
+            annual_rows.append(row_idx)
+        else:
+            monthly_rows.append(row_idx)
+
         rows.append([
             stream.get("merchant", "Unknown"),
+            stream.get("tag", ""),
             stream.get("category", "Other"),
-            stream.get("frequency", "Unknown"),
-            _format_amount(stream.get("last_amount", 0)),
-            _format_amount(stream.get("average_amount", 0)),
+            sub_type,
+            cycle,
+            freq,
+            charge_amt,
+            monthly_amt,
+            annual_total,
+            stream.get("next_charge_date", ""),
+            days_label,
+            stream.get("first_date", ""),
             stream.get("last_date", ""),
-            stream.get("status", "Unknown"),
             stream.get("bank", ""),
+            stream.get("source", "auto").title(),
         ])
+
+    # Grand totals row
+    if len(rows) > 1:
+        total_monthly = round(sum(_est_monthly(s) for s in recurring_streams), 2)
+        total_annual  = round(total_monthly * 12, 2)
+        rows.append(["TOTAL", "", "", "", "", "", "", total_monthly, total_annual,
+                     "", "", "", "", "", ""])
 
     ws.update(rows, "A1")
     _style_header_row(sheet, ws)
+    _style_subscription_rows(sheet, ws, annual_rows, monthly_rows)
+
+    # Bold + border the TOTAL row
+    if len(rows) > 1:
+        total_row_idx = len(rows) - 1
+        sheet.batch_update({"requests": [{
+            "repeatCell": {
+                "range": {
+                    "sheetId":       ws.id,
+                    "startRowIndex": total_row_idx,
+                    "endRowIndex":   total_row_idx + 1,
+                },
+                "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                "fields": "userEnteredFormat(textFormat)",
+            }
+        }]})
+
     print(f"[sheets] Subscriptions: {len(recurring_streams)} streams written")
 
-def _write_last_synced(sheet):
-    ws       = _get_or_create_tab(sheet, SUMMARY_TAB)
-    last_row = len(ws.get_all_values()) + 2
-    ws.update(
-        [[f"Last synced: {datetime.now().strftime('%Y-%m-%d %I:%M %p')}"]],
-        f"A{last_row}"
-    )
