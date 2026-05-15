@@ -25,7 +25,7 @@ from subscription_store import (
     get_manual_subscriptions,
 )
 from webhook_server import start_webhook_server
-from sheets_client import sync_transactions, sync_subscriptions
+from sheets_client import sync_transactions, sync_subscriptions, get_transaction_from_sheets
 import db as transaction_db
 from db import (
     get_recent_transactions, search_transactions,
@@ -1474,9 +1474,14 @@ async def _dispatch_action(action: str, params: dict) -> str:
 
         # ── Path B: transaction ID provided — use transaction data ────────────
         txn = get_transaction_by_id(transaction_id)
+
+        # Fallback: search Google Sheets directly if not in local DB yet
         if not txn:
-            return (f"❌ Transaction `{transaction_id}` not found in the database.\n"
-                    f"> Double-check the ID in your Google Sheet or use `/sync` to refresh.")
+            txn = get_transaction_from_sheets(transaction_id)
+
+        if not txn:
+            return (f"❌ Transaction `{transaction_id}` not found in the database or Google Sheet.\n"
+                    f"> Make sure the ID is correct, then try `/sync` to pull the latest transactions.")
 
         # Resolve merchant name: user override > transaction merchant
         sub_merchant = merchant or txn["merchant"]

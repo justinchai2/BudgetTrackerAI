@@ -114,6 +114,55 @@ def _style_month_separators(sheet, worksheet, separator_row_indices):
     ]
     sheet.batch_update({"requests": requests})
 
+def get_transaction_from_sheets(transaction_id: str) -> dict | None:
+    """
+    Look up a single transaction by ID directly from the Google Sheet.
+    Used as a fallback when the local DB doesn't have the transaction yet
+    (e.g. on a fresh production deployment before the first sync).
+    Returns a dict matching the DB transaction format, or None if not found.
+    """
+    try:
+        gc    = _get_client()
+        sheet = gc.open_by_key(GOOGLE_SHEET_ID)
+        ws    = sheet.worksheet(TXN_TAB)
+        rows  = ws.get_all_values()
+        if not rows:
+            return None
+
+        # TXN_HEADERS: Date, Bank, Merchant, Category, Amount, Status,
+        #              Account (Last 4), Payment Channel, Website, Location,
+        #              Plaid Category, Transaction ID
+        txn_id_col = TXN_HEADERS.index("Transaction ID")
+
+        for row in rows[1:]:   # skip header
+            if len(row) > txn_id_col and row[txn_id_col] == transaction_id:
+                def _col(name):
+                    idx = TXN_HEADERS.index(name)
+                    return row[idx] if idx < len(row) else ""
+                try:
+                    amount = float(_col("Amount").replace("$", "").replace(",", ""))
+                except (ValueError, AttributeError):
+                    amount = 0.0
+                return {
+                    "transaction_id":  transaction_id,
+                    "date":            _col("Date"),
+                    "bank":            _col("Bank"),
+                    "merchant":        _col("Merchant"),
+                    "category":        _col("Category"),
+                    "amount":          amount,
+                    "pending":         _col("Status").lower() == "pending",
+                    "account_id":      "",
+                    "account_mask":    _col("Account (Last 4)"),
+                    "payment_channel": _col("Payment Channel"),
+                    "website":         _col("Website"),
+                    "location":        _col("Location"),
+                    "plaid_category":  _col("Plaid Category"),
+                }
+    except Exception as e:
+        print(f"[sheets] get_transaction_from_sheets error: {e}")
+    return None
+
+
 def sync_transactions(transactions, budget_limits, current_month=None):
     gc    = _get_client()
     sheet = gc.open_by_key(GOOGLE_SHEET_ID)
