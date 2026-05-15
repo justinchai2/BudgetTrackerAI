@@ -1,0 +1,29 @@
+name: Deploy to Droplet
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+jobs:
+  deploy:
+    # For PRs, only run if it was actually merged (not just closed)
+    if: github.event_name == 'push' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to DigitalOcean Droplet
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: root
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          script: |
+            cd /opt/BudgetTrackerAI
+            git pull origin main
+            source venv/bin/activate
+            pip install -r requirements.txt --quiet
+            systemctl restart budgettracker
+            echo "✅ Deployed successfully at $(date)"
