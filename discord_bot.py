@@ -1231,6 +1231,9 @@ async def _dispatch_action(action: str, params: dict) -> str:
         if category not in VALID_CATEGORIES:
             category = "Other"
 
+        # If merchant was previously blacklisted, clear that so it isn't filtered on next sync
+        remove_from_blacklist(merchant)
+
         # Pass None when amount is missing/0 — store.py will look it up from transactions
         resolved_amount = float(amount) if amount and float(amount) > 0 else None
         is_new = add_manual_subscription(merchant, frequency, resolved_amount,
@@ -1407,6 +1410,9 @@ async def _dispatch_action(action: str, params: dict) -> str:
         is_variable = cv > 0.25
 
         sub_merchant = merchant_override or best_merchant
+
+        # If merchant was previously blacklisted, clear that so it isn't filtered on next sync
+        remove_from_blacklist(sub_merchant)
 
         # Show what was found
         found_lines = [
