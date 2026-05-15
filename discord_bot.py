@@ -323,8 +323,15 @@ async def send_uncertain_prompts(channel, uncertain: dict):
 class UncertainReviewView(discord.ui.View):
     """
     Single interactive message that steps through all uncertain merchants one
-    at a time.  Selecting a category auto-advances; Prev/Next/Skip let the
-    user navigate freely.  Done closes the review early.
+    at a time.
+
+    Button behaviour:
+      • Dropdown selection  → change the category, save it, auto-advance
+      • Next ▶              → accept the currently shown category (Gemini's
+                              guess if unchanged), save it, advance
+      • ◀ Prev              → go back (does not change any saved results)
+      • ⏭️ Skip              → leave this merchant uncategorized, advance
+      • ✅ Done              → accept the current category and finish
     """
 
     def __init__(self, uncertain: dict):
@@ -333,6 +340,9 @@ class UncertainReviewView(discord.ui.View):
         self.items: list[tuple[str, dict]] = list(uncertain.items())
         self.index   = 0
         self.results: dict[str, str] = {}   # merchant → chosen category
+        # Tracks what's currently shown in the dropdown for the active page
+        # (Gemini's guess by default, updated when user picks from dropdown)
+        self.current_selection: str = self.items[0][1].get("category", "Other")
         self._rebuild()
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -352,7 +362,7 @@ class UncertainReviewView(discord.ui.View):
             f"> Amount: **${sample.get('amount', '?')}** "
             f"· Date: {sample.get('date', '?')} · Bank: {sample.get('bank', '?')}\n"
             f"> Gemini's best guess: **{guess}** _({conf}% confident)_\n\n"
-            f"Pick the correct category — selecting one **auto-advances** to the next:"
+            f"**Next** accepts Gemini's guess · pick from the dropdown to choose a different category:"
         )
 
     # Alias used by send_uncertain_prompts before the view is attached to a message
@@ -362,19 +372,20 @@ class UncertainReviewView(discord.ui.View):
         """Rebuild the component tree for the current page index."""
         self.clear_items()
         merchant, data = self.items[self.index]
-        guess = data.get("category", "Other")
+        # Reset current_selection to whatever is shown for this page
+        self.current_selection = self.results.get(merchant) or data.get("category", "Other")
 
-        # Row 0 — category dropdown (pre-set to Gemini's guess)
+        # Row 0 — category dropdown (pre-set to saved result or Gemini's guess)
         options = [
             discord.SelectOption(
                 label=cat, value=cat,
-                default=(cat == guess),
+                default=(cat == self.current_selection),
                 emoji="✅" if cat == self.results.get(merchant) else None,
             )
             for cat in VALID_CATEGORIES
         ]
         select = discord.ui.Select(
-            placeholder="Select a category…",
+            placeholder="Select a different category…",
             min_values=1, max_values=1,
             options=options,
             row=0,
@@ -384,26 +395,43 @@ class UncertainReviewView(discord.ui.View):
 
         # Row 1 — navigation buttons
         n = len(self.items)
-        for label, style, disabled, cb, emoji in (
-            ("◀ Prev",  discord.ButtonStyle.secondary, self.index == 0,     self._prev, None),
-            ("Next ▶",  discord.ButtonStyle.primary,   self.index == n - 1, self._next, None),
-            ("Skip",    discord.ButtonStyle.secondary, False,               self._skip, "⏭️"),
-            ("✅ Done",  discord.ButtonStyle.green,     False,               self._done, None),
-        ):
-            btn          = discord.ui.Button(label=label, style=style,
-                                             disabled=disabled, row=1, emoji=emoji)
-            btn.callback = cb
-            self.add_item(btn)
+        is_last = self.index == n - 1
+
+        prev_btn = discord.ui.Button(
+            label="◀ Prev", style=discord.ButtonStyle.secondary,
+            disabled=(self.index == 0), row=1,
+        )
+        prev_btn.callback = self._prev
+        self.add_item(prev_btn)
+
+        if is_last:
+            next_btn = discord.ui.Button(
+                label="💾 Save", style=discord.ButtonStyle.green, row=1,
+            )
+            next_btn.callback = self._save_and_finish
+        else:
+            next_btn = discord.ui.Button(
+                label="Next ▶", style=discord.ButtonStyle.primary, row=1,
+            )
+            next_btn.callback = self._next
+        self.add_item(next_btn)
+
+    def _save_current(self):
+        """Save self.current_selection for the active merchant."""
+        merchant = self.items[self.index][0]
+        save_user_category(merchant, self.current_selection)
+        self.results[merchant] = self.current_selection
 
     # ── interaction callbacks ─────────────────────────────────────────────────
 
     async def _select_callback(self, interaction: discord.Interaction):
+        """User picked a specific category from the dropdown — save and auto-advance."""
         chosen   = interaction.data["values"][0]
         merchant = self.items[self.index][0]
+        self.current_selection = chosen
         save_user_category(merchant, chosen)
         self.results[merchant] = chosen
 
-        # Auto-advance or finish
         if self.index < len(self.items) - 1:
             self.index += 1
             self._rebuild()
@@ -412,24 +440,21 @@ class UncertainReviewView(discord.ui.View):
             await self._finish(interaction)
 
     async def _prev(self, interaction: discord.Interaction):
+        """Go back without saving."""
         self.index = max(0, self.index - 1)
         self._rebuild()
         await interaction.response.edit_message(content=self.build_content(), view=self)
 
     async def _next(self, interaction: discord.Interaction):
-        self.index = min(len(self.items) - 1, self.index + 1)
+        """Save current selection and advance to the next merchant."""
+        self._save_current()
+        self.index += 1
         self._rebuild()
         await interaction.response.edit_message(content=self.build_content(), view=self)
 
-    async def _skip(self, interaction: discord.Interaction):
-        if self.index < len(self.items) - 1:
-            self.index += 1
-            self._rebuild()
-            await interaction.response.edit_message(content=self.build_content(), view=self)
-        else:
-            await self._finish(interaction)
-
-    async def _done(self, interaction: discord.Interaction):
+    async def _save_and_finish(self, interaction: discord.Interaction):
+        """Save the last merchant's selection and finish the review."""
+        self._save_current()
         await self._finish(interaction)
 
     async def _finish(self, interaction: discord.Interaction):
@@ -594,69 +619,51 @@ async def subscriptions_cmd(interaction: discord.Interaction):
         if days <= 7: return f" 🔔 in {days}d ({next_str})"
         return f" · next {next_str}"
 
+    def _fmt_sub_line(s, annual=False):
+        """
+        Format one subscription line.
+        Shows the last confirmed charge amount.
+        🔺 (was $X) shown when the charge increased vs the previous one.
+        🔽 (was $X) shown when it decreased.
+        """
+        is_estimate = s.get("is_estimate", False)
+        amt         = s["last_amount"]
+        prev_amt    = s.get("prev_amount")
+        sub_type    = (s.get("sub_type") or "").replace("_", " ").title()
+        type_tag    = f" `{sub_type}`" if sub_type else ""
+        src_tag     = " _(manual)_" if s.get("source") == "manual" else ""
+        user_tag    = f" — _{s['tag']}_" if s.get("tag") else ""
+        yr          = "/yr" if annual else ""
+
+        # Trend vs previous charge
+        if prev_amt and prev_amt != amt:
+            arrow       = "🔺" if amt > prev_amt else "🔽"
+            trend       = f" {arrow} _(was ${prev_amt})_"
+        else:
+            trend       = ""
+
+        if is_estimate:
+            amt_display = f"~${amt}{yr} _(est. — auto-updates on next charge)_{trend}"
+        else:
+            amt_display = f"${amt}{yr}{trend}"
+
+        return f"  **{s['merchant']}**{user_tag}{type_tag} — {amt_display} · {s['frequency']}{_charge_tag(s)}{src_tag}"
+
     if recurring:
         lines.append("**Monthly / Recurring**")
         for s in recurring:
-            is_variable = s.get("variable_amount", False)
-            is_estimate = s.get("is_estimate", False)
-            amt         = s["last_amount"]
-            avg_amt     = s.get("average_amount", amt)
-            prev_amt    = s.get("prev_amount")
-            monthly     = _est_monthly(s)
+            monthly = _est_monthly(s)
             monthly_total += monthly
             annual_total  += monthly * 12
-            sub_type  = (s.get("sub_type") or "").replace("_", " ").title()
-            type_tag  = f" `{sub_type}`" if sub_type else ""
-            src_tag   = " _(manual)_" if s.get("source") == "manual" else ""
-            user_tag  = f" — _{s['tag']}_" if s.get("tag") else ""
-            # Trend indicator vs previous charge
-            if prev_amt and prev_amt != amt:
-                arrow    = "↑" if amt > prev_amt else "↓"
-                trend    = f" {arrow} _(was ${prev_amt})_"
-            else:
-                trend    = ""
-            if is_variable:
-                amt_display = f"Variable _(~${avg_amt} avg)_{trend}"
-            elif is_estimate:
-                amt_display = f"~${amt} _(est. — auto-updates on next charge)_{trend}"
-            else:
-                amt_display = f"${amt}{trend}"
-            lines.append(
-                f"  **{s['merchant']}**{user_tag}{type_tag} — {amt_display} {s['frequency']} "
-                f"_(~${monthly}/mo)_{_charge_tag(s)}{src_tag}"
-            )
+            lines.append(_fmt_sub_line(s))
 
     if annuals:
         lines.append("\n**Annual Charges** _(shown as monthly split)_")
         for s in annuals:
-            is_variable = s.get("variable_amount", False)
-            is_estimate = s.get("is_estimate", False)
-            amt         = s["last_amount"]
-            avg_amt     = s.get("average_amount", amt)
-            prev_amt    = s.get("prev_amount")
-            monthly     = _est_monthly(s)
+            monthly = _est_monthly(s)
             monthly_total += monthly
-            annual_total  += amt
-            sub_type  = (s.get("sub_type") or "").replace("_", " ").title()
-            type_tag  = f" `{sub_type}`" if sub_type else ""
-            src_tag   = " _(manual)_" if s.get("source") == "manual" else ""
-            user_tag  = f" — _{s['tag']}_" if s.get("tag") else ""
-            # Trend indicator vs previous charge
-            if prev_amt and prev_amt != amt:
-                arrow    = "↑" if amt > prev_amt else "↓"
-                trend    = f" {arrow} _(was ${prev_amt})_"
-            else:
-                trend    = ""
-            if is_variable:
-                amt_display = f"Variable _(~${avg_amt} avg)_{trend}"
-            elif is_estimate:
-                amt_display = f"~${amt}/yr _(est. — auto-updates on next charge)_{trend}"
-            else:
-                amt_display = f"${amt}/yr{trend}"
-            lines.append(
-                f"  **{s['merchant']}**{user_tag}{type_tag} — {amt_display} "
-                f"_(~${monthly}/mo)_{_charge_tag(s)}{src_tag}"
-            )
+            annual_total  += s["last_amount"]
+            lines.append(_fmt_sub_line(s, annual=True))
 
     lines.append(
         f"\n**Monthly total: ~${round(monthly_total, 2)}** "
