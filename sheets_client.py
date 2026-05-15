@@ -80,9 +80,25 @@ SUBS_HEADERS = [
     "Next Charge", "Days Away", "First Seen", "Last Seen", "Bank", "Source"
 ]
 
-def _get_client():
-    creds = Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-    return gspread.authorize(creds)
+_cached_client: gspread.Client | None = None
+_cached_sheet = None
+
+def _get_client() -> gspread.Client:
+    """Return a cached gspread client, re-authenticating only when needed."""
+    global _cached_client
+    if _cached_client is None:
+        creds = Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        _cached_client = gspread.authorize(creds)
+        print("[sheets] Authenticated with Google Sheets API")
+    return _cached_client
+
+def _get_sheet():
+    """Return a cached Spreadsheet object, re-opening only when needed."""
+    global _cached_sheet
+    if _cached_sheet is None:
+        _cached_sheet = _get_client().open_by_key(GOOGLE_SHEET_ID)
+        print("[sheets] Opened spreadsheet")
+    return _cached_sheet
 
 def _get_or_create_tab(sheet, title):
     try:
@@ -170,8 +186,7 @@ def get_transaction_from_sheets(transaction_id: str) -> dict | None:
     Returns a dict matching the DB transaction format, or None if not found.
     """
     try:
-        gc    = _get_client()
-        sheet = gc.open_by_key(GOOGLE_SHEET_ID)
+        sheet = _get_sheet()
         ws    = sheet.worksheet(TXN_TAB)
         rows  = ws.get_all_values()
         if not rows:
@@ -215,8 +230,7 @@ def sync_transactions(transactions, budget_limits, current_month=None):
     import time as _time
     state    = _load_sync_state()
     txn_hash = _hash_transactions(transactions)
-    gc       = _get_client()
-    sheet    = gc.open_by_key(GOOGLE_SHEET_ID)
+    sheet    = _get_sheet()
 
     _delete_old_bank_tabs(sheet)
 
@@ -714,8 +728,7 @@ def sync_subscriptions(recurring_streams):
         print(f"[sheets] Subscriptions: unchanged ({len(recurring_streams)} subs), skipping rewrite")
         return
 
-    gc    = _get_client()
-    sheet = gc.open_by_key(GOOGLE_SHEET_ID)
+    sheet = _get_sheet()
     ws    = _get_or_create_tab(sheet, SUBS_TAB)
     ws.clear()
     _clear_all_formatting(sheet, ws)

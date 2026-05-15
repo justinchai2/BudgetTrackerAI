@@ -1,3 +1,9 @@
+import sys
+# Force line-buffered stdout so print() appears in journalctl immediately
+# (Python buffers stdout when piped, which hides logs in systemd services)
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
