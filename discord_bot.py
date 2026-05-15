@@ -1,8 +1,11 @@
 import sys
 # Force line-buffered stdout so print() appears in journalctl immediately
 # (Python buffers stdout when piped, which hides logs in systemd services)
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except AttributeError:
+    pass  # reconfigure not available in this Python/env — safe to ignore
 
 import asyncio
 import discord
