@@ -113,6 +113,7 @@ def init_db():
             "tag               TEXT NOT NULL DEFAULT ''",
             "is_estimate       INTEGER NOT NULL DEFAULT 0",
             "prev_amount       REAL",
+            "merchant_id       TEXT",                       # FK → merchant_categories.merchant_id
         ):
             col_name = col_def.split()[0]
             try:
@@ -154,6 +155,9 @@ def init_db():
         # Backfill merchant_id for any rows that don't have one yet
         _backfill_merchant_ids(conn)
 
+        # Backfill merchant_id FK on subscriptions rows that don't have one yet
+        _backfill_subscription_merchant_ids(conn)
+
         # ── One-time migration from JSON files ────────────────────────────
         _migrate_category_json(conn)
 
@@ -173,6 +177,47 @@ def _backfill_merchant_ids(conn):
         )
     if rows:
         print(f"[db] Backfilled merchant_id for {len(rows)} merchant_categories row(s)")
+
+
+def _backfill_subscription_merchant_ids(conn):
+    """
+    Link existing subscriptions to merchant_categories via merchant_id.
+    For subscriptions with no matching merchant_categories row, one is created
+    so the FK can be populated.
+    """
+    import uuid as _uuid
+    subs = conn.execute(
+        "SELECT merchant, category FROM subscriptions WHERE merchant_id IS NULL"
+    ).fetchall()
+    for sub in subs:
+        mc_row = conn.execute(
+            "SELECT merchant_id FROM merchant_categories WHERE LOWER(merchant) = LOWER(?)",
+            (sub["merchant"],),
+        ).fetchone()
+        if mc_row and mc_row["merchant_id"]:
+            mid = mc_row["merchant_id"]
+        else:
+            mid = str(_uuid.uuid4())
+            conn.execute("""
+                INSERT INTO merchant_categories
+                    (merchant, merchant_id, category, source, confidence, is_uncertain)
+                VALUES (?, ?, ?, 'auto', 1.0, 0)
+                ON CONFLICT(merchant) DO UPDATE SET
+                    merchant_id = COALESCE(merchant_categories.merchant_id, excluded.merchant_id)
+            """, (sub["merchant"], mid, sub["category"]))
+            # Re-fetch in case of conflict that kept an existing ID
+            mc_row2 = conn.execute(
+                "SELECT merchant_id FROM merchant_categories WHERE LOWER(merchant) = LOWER(?)",
+                (sub["merchant"],),
+            ).fetchone()
+            if mc_row2 and mc_row2["merchant_id"]:
+                mid = mc_row2["merchant_id"]
+        conn.execute(
+            "UPDATE subscriptions SET merchant_id = ? WHERE merchant = ?",
+            (mid, sub["merchant"]),
+        )
+    if subs:
+        print(f"[db] Backfilled merchant_id FK for {len(subs)} subscription(s)")
 
 
 def _migrate_category_json(conn):
@@ -522,53 +567,89 @@ def get_merchant_avg_amount(merchant: str, limit: int = 12) -> float | None:
     return round(sum(amounts) / len(amounts), 2)
 
 
+def _resolve_merchant_id(conn, merchant: str, category: str) -> str:
+    """
+    Return the merchant_id for a merchant, creating a merchant_categories row
+    if one doesn't exist yet.  The returned ID is stable for the lifetime of
+    the merchant name (i.e. survives upserts, only changes on an explicit rename).
+    """
+    import uuid as _uuid
+    row = conn.execute(
+        "SELECT merchant_id FROM merchant_categories WHERE LOWER(merchant) = LOWER(?)",
+        (merchant,),
+    ).fetchone()
+    if row and row["merchant_id"]:
+        return row["merchant_id"]
+    # No entry yet — create one and return the new ID
+    mid = str(_uuid.uuid4())
+    conn.execute("""
+        INSERT INTO merchant_categories
+            (merchant, merchant_id, category, source, confidence, is_uncertain)
+        VALUES (?, ?, ?, 'auto', 1.0, 0)
+        ON CONFLICT(merchant) DO UPDATE SET
+            merchant_id = COALESCE(merchant_categories.merchant_id, excluded.merchant_id)
+    """, (merchant, mid, category))
+    # Re-fetch in case a concurrent insert already set an ID
+    row2 = conn.execute(
+        "SELECT merchant_id FROM merchant_categories WHERE LOWER(merchant) = LOWER(?)",
+        (merchant,),
+    ).fetchone()
+    return row2["merchant_id"] if row2 and row2["merchant_id"] else mid
+
+
 def upsert_subscriptions(streams: list):
     """
     Save detected + manual subscriptions to the DB.
     Computes next_charge_date and days_until_charge automatically.
+    Each subscription is linked to merchant_categories via merchant_id (FK).
     """
     from sheets_client import _billing_cycle   # local import to avoid circular
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    rows = []
-    for s in streams:
-        freq       = s.get("frequency", "")
-        next_date  = _next_charge(s.get("last_date", ""), freq)
-        days_until = _days_until(next_date) if next_date else None
-        rows.append({
-            "merchant":          s["merchant"],
-            "source":            "manual" if str(s.get("occurrence_count", "")) == "manual" else "auto",
-            "frequency":         freq,
-            "billing_cycle":     _billing_cycle(freq),
-            "last_amount":       float(s.get("last_amount", 0)),
-            "average_amount":    float(s.get("average_amount", 0)),
-            "last_date":         s.get("last_date", ""),
-            "first_date":        s.get("first_date", ""),
-            "next_charge_date":  next_date,
-            "days_until_charge": days_until,
-            "category":          s.get("category", "Other"),
-            "bank":              s.get("bank", ""),
-            "sub_type":          s.get("sub_type") or "",
-            "occurrence_count":  str(s.get("occurrence_count", "")),
-            "is_active":         1 if s.get("is_active", True) else 0,
-            "updated_at":        now,
-            "variable_amount":   1 if s.get("variable_amount") else 0,
-            "tag":               s.get("tag") or "",
-            "is_estimate":       1 if s.get("is_estimate") else 0,
-        })
 
     with _get_conn() as conn:
+        rows = []
+        for s in streams:
+            freq        = s.get("frequency", "")
+            next_date   = _next_charge(s.get("last_date", ""), freq)
+            days_until  = _days_until(next_date) if next_date else None
+            category    = s.get("category", "Other")
+            merchant_id = _resolve_merchant_id(conn, s["merchant"], category)
+            rows.append({
+                "merchant":          s["merchant"],
+                "merchant_id":       merchant_id,
+                "source":            "manual" if str(s.get("occurrence_count", "")) == "manual" else "auto",
+                "frequency":         freq,
+                "billing_cycle":     _billing_cycle(freq),
+                "last_amount":       float(s.get("last_amount", 0)),
+                "average_amount":    float(s.get("average_amount", 0)),
+                "last_date":         s.get("last_date", ""),
+                "first_date":        s.get("first_date", ""),
+                "next_charge_date":  next_date,
+                "days_until_charge": days_until,
+                "category":          category,
+                "bank":              s.get("bank", ""),
+                "sub_type":          s.get("sub_type") or "",
+                "occurrence_count":  str(s.get("occurrence_count", "")),
+                "is_active":         1 if s.get("is_active", True) else 0,
+                "updated_at":        now,
+                "variable_amount":   1 if s.get("variable_amount") else 0,
+                "tag":               s.get("tag") or "",
+                "is_estimate":       1 if s.get("is_estimate") else 0,
+            })
+
         conn.executemany("""
             INSERT INTO subscriptions
-                (merchant, source, frequency, billing_cycle, last_amount, average_amount,
+                (merchant, merchant_id, source, frequency, billing_cycle, last_amount, average_amount,
                  last_date, first_date, next_charge_date, days_until_charge,
                  category, bank, sub_type, occurrence_count, is_active, updated_at,
                  variable_amount, tag)
             VALUES
-                (:merchant, :source, :frequency, :billing_cycle, :last_amount, :average_amount,
+                (:merchant, :merchant_id, :source, :frequency, :billing_cycle, :last_amount, :average_amount,
                  :last_date, :first_date, :next_charge_date, :days_until_charge,
                  :category, :bank, :sub_type, :occurrence_count, :is_active, :updated_at,
                  :variable_amount, :tag)
             ON CONFLICT(merchant) DO UPDATE SET
+                merchant_id       = excluded.merchant_id,
                 source            = excluded.source,
                 frequency         = excluded.frequency,
                 billing_cycle     = excluded.billing_cycle,
@@ -831,6 +912,7 @@ def _sub_to_dict(row) -> dict:
         "tag":               row["tag"] or "",
         "is_estimate":       bool(row["is_estimate"]),
         "prev_amount":       row["prev_amount"],
+        "merchant_id":       row["merchant_id"],
         # Fields expected by sync_subscriptions / Discord command
         "stream_type":       "expense",
         "status":            "Active",
