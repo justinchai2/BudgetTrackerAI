@@ -182,7 +182,7 @@ def _progress_bar(pct, label, width=20):
 # Tracks the currently-running sync so it can be cancelled via /cancel_sync.
 # ---------------------------------------------------------------------------
 
-_sync_task: asyncio.Task | None = None
+_sync_task = None   # asyncio.Task | None
 
 def _start_sync(source: str) -> asyncio.Task:
     """

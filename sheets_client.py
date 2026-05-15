@@ -80,10 +80,10 @@ SUBS_HEADERS = [
     "Next Charge", "Days Away", "First Seen", "Last Seen", "Bank", "Source"
 ]
 
-_cached_client: gspread.Client | None = None
-_cached_sheet = None
+_cached_client = None   # gspread Client, reused across calls
+_cached_sheet  = None   # gspread Spreadsheet, reused across calls
 
-def _get_client() -> gspread.Client:
+def _get_client():
     """Return a cached gspread client, re-authenticating only when needed."""
     global _cached_client
     if _cached_client is None:
