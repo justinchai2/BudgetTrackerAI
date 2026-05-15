@@ -429,6 +429,14 @@ remove_subscription
   params: merchant (str)
   example: "remove OpenAI from subscriptions"
 
+get_transaction
+  params: transaction_id (str)
+  use when the user provides a specific transaction ID and wants to see its details.
+  examples:
+    "what is transaction ID abc123?"         → transaction_id: "abc123"
+    "look up transaction abc123 for me"      → transaction_id: "abc123"
+    "show me details for txn ID xyz789"      → transaction_id: "xyz789"
+
 find_transaction
   params: query (str) — keyword(s) to search for in merchant names
   use when the user wants to look up a specific merchant or check if a transaction exists.

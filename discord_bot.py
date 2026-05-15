@@ -1247,6 +1247,38 @@ async def _dispatch_action(action: str, params: dict) -> str:
                 f"{amt_line} {frequency} (~${monthly}/mo) · {category} · {bank}{tag_line}\n"
                 f"> Google Sheet updated.")
 
+    # ── get_transaction ──────────────────────────────────────────────────
+    elif action == "get_transaction":
+        transaction_id = params.get("transaction_id", "").strip()
+        if not transaction_id:
+            return "Please provide a transaction ID to look up."
+
+        txn = get_transaction_by_id(transaction_id) or get_transaction_from_sheets(transaction_id)
+        if not txn:
+            return (f"❌ Transaction `{transaction_id}` not found in the database or Google Sheet.\n"
+                    f"> Try running `/sync` first to pull the latest transactions from your bank.")
+
+        status = "⏳ Pending" if txn.get("pending") else "✅ Posted"
+        lines = [
+            f"**Transaction Details**",
+            f"> **ID:** `{txn['transaction_id']}`",
+            f"> **Merchant:** {txn['merchant']}",
+            f"> **Amount:** ${txn['amount']}",
+            f"> **Date:** {txn['date']}",
+            f"> **Category:** {txn['category']}",
+            f"> **Bank:** {txn['bank']}",
+            f"> **Status:** {status}",
+        ]
+        if txn.get("payment_channel"):
+            lines.append(f"> **Payment Channel:** {txn['payment_channel']}")
+        if txn.get("account_mask"):
+            lines.append(f"> **Account:** ···{txn['account_mask']}")
+        if txn.get("location"):
+            lines.append(f"> **Location:** {txn['location']}")
+        if txn.get("plaid_category"):
+            lines.append(f"> **Plaid Category:** {txn['plaid_category']}")
+        return "\n".join(lines)
+
     # ── find_transaction ─────────────────────────────────────────────────
     elif action == "find_transaction":
         import statistics
