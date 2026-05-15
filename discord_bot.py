@@ -4,6 +4,7 @@ import sys
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -175,6 +176,45 @@ def _progress_bar(pct, label, width=20):
     filled = int(width * pct / 100)
     bar    = "█" * filled + "░" * (width - filled)
     return f"`[{bar}]` **{pct}%** — {label}"
+
+# ---------------------------------------------------------------------------
+# Sync task management
+# Tracks the currently-running sync so it can be cancelled via /cancel_sync.
+# ---------------------------------------------------------------------------
+
+_sync_task: asyncio.Task | None = None
+
+def _start_sync(source: str) -> asyncio.Task:
+    """
+    Launch run_full_sync as a background asyncio task and store the reference.
+    If a sync is already running, returns the existing task without starting a new one.
+    """
+    global _sync_task
+    if _sync_task and not _sync_task.done():
+        print(f"[sync] Sync already running — ignoring new request from '{source}'")
+        return _sync_task
+    _sync_task = asyncio.create_task(_sync_wrapper(source))
+    return _sync_task
+
+async def _sync_wrapper(source: str):
+    """Runs run_full_sync and clears the global task reference when done."""
+    global _sync_task
+    try:
+        await run_full_sync(source=source)
+    except asyncio.CancelledError:
+        print(f"[sync] Sync cancelled ({source})")
+        # Try to update the progress message so it doesn't hang on screen
+        digest_channel = bot.get_channel(DISCORD_CHANNEL_ID)
+        if digest_channel:
+            try:
+                await digest_channel.send("⛔ **Sync cancelled.**")
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[sync] Sync error ({source}): {e}")
+    finally:
+        _sync_task = None
+
 
 async def run_full_sync(source="manual"):
     digest_channel = bot.get_channel(DISCORD_CHANNEL_ID)
@@ -593,9 +633,28 @@ class RecategorizeView(discord.ui.View):
 
 @bot.tree.command(name="sync", description="Manually sync transactions from all banks now")
 async def sync_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    await run_full_sync(source="manual /sync")
-    await interaction.followup.send("✅ Sync complete!", ephemeral=True)
+    global _sync_task
+    if _sync_task and not _sync_task.done():
+        await interaction.response.send_message(
+            "⚠️ A sync is already running. Use `/cancel_sync` to stop it first.",
+            ephemeral=True,
+        )
+        return
+    _start_sync(source="manual /sync")
+    await interaction.response.send_message(
+        "🔄 Sync started! Watch the progress in this channel.", ephemeral=True
+    )
+
+@bot.tree.command(name="cancel_sync", description="Cancel a sync that is currently running")
+async def cancel_sync_cmd(interaction: discord.Interaction):
+    global _sync_task
+    if _sync_task and not _sync_task.done():
+        _sync_task.cancel()
+        await interaction.response.send_message("⛔ Sync cancelled.", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            "No sync is currently running.", ephemeral=True
+        )
 
 @bot.tree.command(name="budget", description="Show current month's budget status")
 async def budget_cmd(interaction: discord.Interaction):
@@ -1943,7 +2002,7 @@ async def on_message(message: discord.Message):
             if len(actions) == 1 and actions[0].get("action") == "sync":
                 await message.remove_reaction("⏳", bot.user)
                 await message.reply("🔄 Starting a full sync...")
-                await run_full_sync(source=f"@mention by {message.author.display_name}")
+                _start_sync(source=f"@mention by {message.author.display_name}")
                 return
 
             # Remove hourglass — done processing
@@ -1999,7 +2058,7 @@ async def on_message(message: discord.Message):
 ])
 async def scheduled_sync():
     print(f"[scheduler] Running scheduled sync...")
-    await run_full_sync(source="scheduled")
+    _start_sync(source="scheduled")
 
 
 @tasks.loop(time=datetime.time(hour=SUBSCRIPTION_REMINDER_HOUR, minute=0, tzinfo=TZ))
