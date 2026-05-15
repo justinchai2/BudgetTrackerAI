@@ -135,6 +135,10 @@ class SubReviewView(discord.ui.View):
             upsert_subscriptions(confirmed + manual_subs)
             sync_subscriptions(confirmed + manual_subs)
 
+        # Blacklist rejected merchants so they never appear in the review again
+        for s in rejected:
+            add_to_blacklist(s["merchant"])
+
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(view=self)
@@ -144,7 +148,7 @@ class SubReviewView(discord.ui.View):
         result   = (
             f"✅ **Subscription review complete!**\n"
             f"> Saved ({len(confirmed)}): {conf_str}\n"
-            f"> Skipped ({len(rejected)}): {rej_str}"
+            f"> Skipped ({len(rejected)}): {rej_str} _(blacklisted — won't appear again)_"
         )
         if confirmed:
             result += "\n> Google Sheet updated."
@@ -238,8 +242,11 @@ async def run_full_sync(source="manual"):
     manual_subs = get_manual_subscriptions()
 
     existing_merchants = {s["merchant"].lower() for s in get_subscriptions()}
+    blacklist          = {m.lower() for m in get_blacklist()}
     known_streams  = [s for s in streams if s["merchant"].lower() in existing_merchants]
-    new_candidates = [s for s in streams if s["merchant"].lower() not in existing_merchants]
+    new_candidates = [s for s in streams
+                      if s["merchant"].lower() not in existing_merchants
+                      and s["merchant"].lower() not in blacklist]
 
     # Always re-upsert known subscriptions (keeps amounts/dates fresh) + manual ones
     all_known = known_streams + manual_subs
@@ -1460,6 +1467,27 @@ async def _dispatch_action(action: str, params: dict) -> str:
         if streams:
             sync_subscriptions(streams)
         return f"🗑️ **{merchant}** removed from subscriptions. Google Sheet updated."
+
+    # ── restore_subscription ──────────────────────────────────────────────
+    elif action == "restore_subscription":
+        merchant = params.get("merchant", "").strip()
+        if not merchant:
+            return "I need a merchant name to restore. Which subscription should I bring back?"
+        remove_from_blacklist(merchant)
+        # Re-detect so if it's in the transaction history it gets re-added automatically
+        ytd     = transaction_db.get_year_to_date_transactions()
+        streams = detect_subscriptions(ytd)
+        match   = next((s for s in streams if s["merchant"].lower() == merchant.lower()), None)
+        if match:
+            upsert_subscriptions([match])
+            sync_subscriptions([match])
+            return (f"✅ **{merchant}** has been restored and re-added to your subscriptions! "
+                    f"Google Sheet updated.")
+        else:
+            return (f"✅ **{merchant}** removed from the blacklist — it will reappear automatically "
+                    f"the next time a recurring charge is detected in your transactions. "
+                    f"If it doesn't show up, you can also add it manually: "
+                    f"\"add {merchant} as a subscription\".")
 
     # ── update_subscription ───────────────────────────────────────────────
     elif action == "update_subscription":

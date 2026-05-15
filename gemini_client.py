@@ -429,6 +429,15 @@ remove_subscription
   params: merchant (str)
   example: "remove OpenAI from subscriptions"
 
+restore_subscription
+  params: merchant (str)
+  use when the user wants to bring back a subscription they previously removed/blacklisted.
+  examples:
+    "bring back Netflix"               → merchant: "Netflix"
+    "restore my Spotify subscription"  → merchant: "Spotify"
+    "add Hulu back"                    → merchant: "Hulu"
+    "un-remove Disney Plus"            → merchant: "Disney Plus"
+
 get_transaction
   params: transaction_id (str)
   use when the user provides a specific transaction ID and wants to see its details.
