@@ -49,7 +49,6 @@ TZ = ZoneInfo(TIMEZONE)
 # ---------------------------------------------------------------------------
 
 intents = discord.Intents.default()
-intents.message_content = True   # needed to read message text for @mention NL commands
 bot     = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------------------------------------------------------------------------
@@ -248,13 +247,14 @@ async def run_full_sync(source="manual"):
     if all_known:
         sync_subscriptions(all_known)
 
-    # Stage new candidates for review via interactive dropdown
+    # Stage new candidates for review via interactive dropdown (sent to review channel)
     if new_candidates:
+        review_channel = bot.get_channel(DISCORD_REVIEW_CHANNEL_ID) or digest_channel
         view = SubReviewView(new_candidates)
         names_preview = ", ".join(s["merchant"] for s in new_candidates[:5])
         if len(new_candidates) > 5:
             names_preview += f" + {len(new_candidates) - 5} more"
-        await digest_channel.send(
+        await review_channel.send(
             f"📋 **Subscription Review** — {len(new_candidates)} new recurring charge(s) detected: "
             f"_{names_preview}_\n"
             f"All are pre-selected. **Deselect** any that aren't real subscriptions, then click **Save Selected**.",
@@ -505,28 +505,20 @@ class RecategorizeSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         chosen = self.values[0]
+        await interaction.response.defer(ephemeral=True)
+
         save_user_category(self.merchant, chosen)
         transaction_db.update_merchant_category(self.merchant, chosen)
 
         # Re-sync sheets with updated category
-        await interaction.response.send_message(
-            f"Updated! **{self.merchant}** is now **{chosen}**. "
-            f"Re-syncing your Google Sheet...",
-            ephemeral=True,
-        )
-        transactions = fetch_all_transactions()
-        transactions, _ = categorize_transactions(transactions)
-        transaction_db.upsert_transactions(transactions)
         ytd = transaction_db.get_year_to_date_transactions()
         sync_transactions(ytd, BUDGET_LIMITS, current_month=transaction_db.get_current_month_transactions())
 
-        channel = bot.get_channel(DISCORD_CHANNEL_ID)
-        if channel:
-            await channel.send(
-                f"**Category Updated**\n"
-                f"> **{self.merchant}** recategorized to **{chosen}**\n"
-                f"> Google Sheet updated — all past and future transactions affected."
-            )
+        await interaction.followup.send(
+            f"✅ **{self.merchant}** recategorized to **{chosen}**.\n"
+            f"> Google Sheet updated — all past and future transactions affected.",
+            ephemeral=True,
+        )
         self.view.stop()
 
 class RecategorizeView(discord.ui.View):
@@ -540,8 +532,9 @@ class RecategorizeView(discord.ui.View):
 
 @bot.tree.command(name="sync", description="Manually sync transactions from all banks now")
 async def sync_cmd(interaction: discord.Interaction):
-    await interaction.response.send_message("Starting manual sync...")
+    await interaction.response.defer(ephemeral=True)
     await run_full_sync(source="manual /sync")
+    await interaction.followup.send("✅ Sync complete!", ephemeral=True)
 
 @bot.tree.command(name="budget", description="Show current month's budget status")
 async def budget_cmd(interaction: discord.Interaction):

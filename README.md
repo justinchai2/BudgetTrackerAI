@@ -1,50 +1,56 @@
 # BudgetTrackerAI
 
-A Discord bot that connects to your Chase, Citi, and Capital One accounts via Plaid, consolidates all transactions into a Google Sheet, and uses Gemini AI to categorize spending and deliver daily budget digests and alerts.
+A self-hosted Discord bot that connects to your bank accounts via Plaid, categorizes every transaction with Gemini AI, syncs everything to a Google Sheet, and delivers daily budget digests — all controlled through Discord slash commands and a natural language AI assistant.
 
 ---
 
 ## Features
 
-- **Multi-bank sync** — pulls transactions from Chase, Citi, and Capital One via Plaid
-- **AI categorization** — Gemini 2.5 Flash categorizes every merchant automatically, with confidence scoring
-- **Google Sheets** — consolidated view with a tab per bank, a summary tab, and a subscriptions tab
-- **Daily digest** — 10am Discord message with spending summary and Gemini-written insights
+- **Multi-bank sync** — pulls transactions from any bank via Plaid (Chase, Citi, Capital One, etc.)
+- **AI categorization** — Gemini 2.5 Flash categorizes every merchant automatically with confidence scoring; uncertain ones are sent to a review channel for manual approval
+- **Natural language bot** — @mention the bot in any message to add subscriptions, ask budget questions, find transactions, recategorize merchants, and more
+- **Google Sheets sync** — one tab per bank + a Summary tab + a Subscriptions tab, updated on every sync
+- **Subscription tracking** — auto-detects recurring charges, supports variable-amount bills, manual entries, tags, and estimate amounts that auto-update when the real charge arrives
+- **Subscription review** — newly detected subscriptions are staged in a single interactive dropdown for you to approve before saving
+- **Twice-daily digest** — 9 AM budget overview and 11:59 PM day-recap with a Gemini-written narrative
 - **Budget alerts** — fires when you exceed a spending category limit
 - **Large transaction alerts** — global and per-category dollar thresholds
-- **Recurring transactions** — detects subscriptions and recurring charges via Plaid
-- **Pending transactions** — shown in the Sheet with a Pending label, excluded from budget calculations
-- **Twice-daily sync** — automatic pulls at 9am and 9pm
-- **Recategorization** — change any merchant's category via `/recategorize` or by filling in the Custom Category column in Sheets
-- **User review prompts** — uncertain categorizations are sent to a dedicated Discord channel for manual review
+- **Scheduled auto-sync** — pulls transactions at 9 AM and 9 PM daily
+- **Plaid webhook support** — real-time transaction alerts when a new charge posts
 
 ---
 
 ## Architecture
 
 ```
-Plaid API (Chase / Citi / Capital One)
-        ↓
-  plaid_client.py  ─── fetch transactions + recurring streams
-        ↓
- gemini_client.py  ─── AI categorization (cached by merchant)
-        ↓
-  budget_engine.py ─── overage detection, large txn alerts
-        ↓
-  sheets_client.py ─── write to Google Sheets
-        ↓
-  discord_bot.py   ─── commands, scheduled tasks, alerts
+Plaid API  ──────────────────────────────────────────────────────
+  plaid_client.py      fetch transactions + item health checks
+        │
+  gemini_client.py     AI categorization (cached in SQLite)
+        │
+  budget_engine.py     overage detection, large-txn alerts
+        │
+  sheets_client.py     write to Google Sheets
+        │
+  discord_bot.py       slash commands, NL bot, scheduled tasks
+        │
+  db.py                SQLite — transactions, subscriptions,
+                                merchant_categories
+        │
+  subscription_detector.py   detect recurring charges from history
+  subscription_store.py      manual subscription overrides (JSON)
+  webhook_server.py          Plaid webhook receiver (optional)
 ```
 
 ---
 
 ## Prerequisites
 
-- Python 3.9+
-- A [Plaid](https://dashboard.plaid.com) account (free sandbox tier)
-- A [Google Cloud](https://console.cloud.google.com) project with Sheets and Drive APIs enabled
-- A [Google AI Studio](https://aistudio.google.com) Gemini API key (free)
-- A [Discord](https://discord.com/developers/applications) application and bot token
+- **Python 3.11+**
+- A [Plaid](https://dashboard.plaid.com) account (free sandbox, ~$0.30/account/month in production)
+- A [Google Cloud](https://console.cloud.google.com) service account with Sheets + Drive APIs enabled
+- A [Google AI Studio](https://aistudio.google.com) Gemini API key (free tier: 1,500 requests/day)
+- A [Discord](https://discord.com/developers/applications) application + bot token
 
 ---
 
@@ -53,7 +59,7 @@ Plaid API (Chase / Citi / Capital One)
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/justinchai2/BudgetTrackerAI.git
+git clone https://github.com/justinchai22/BudgetTrackerAI.git
 cd BudgetTrackerAI
 ```
 
@@ -69,93 +75,142 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Fill in all values in `.env` — see the API Keys section below for where to get each one.
+Then fill in every value — the sections below explain where to get each one.
 
-### 4. Set up Plaid
+---
+
+### 4. Plaid — bank connectivity
 
 1. Create a free account at [dashboard.plaid.com](https://dashboard.plaid.com)
 2. Go to **Team Settings → Keys** and copy your **Client ID** and **Sandbox Secret**
-3. Enable the **Transactions** product (covers both regular and recurring transactions)
-4. Run the setup script once per bank:
+3. Add them to `.env`:
+   ```
+   PLAID_CLIENT_ID=your_client_id
+   PLAID_SECRET=your_sandbox_secret
+   PLAID_ENV=sandbox
+   ```
+4. Run the link script **once per bank**:
+   ```bash
+   python plaid_setup.py
+   ```
+   - A browser window opens with Plaid Link
+   - In sandbox, search for **First Platypus Bank** and log in with:
+     - Username: `user_good` · Password: `pass_good` · MFA: `1234`
+   - The terminal prints an access token — add it to `.env` as:
+     ```
+     PLAID_ACCESS_TOKEN_CHASE=access-sandbox-...
+     PLAID_ACCESS_TOKEN_CITI=access-sandbox-...
+     ```
+   - The suffix after `PLAID_ACCESS_TOKEN_` becomes the bank name (underscores → spaces, title-cased)
+   - Repeat for every bank you want to connect
 
-```bash
-python plaid_setup.py
-```
+> **Going to production:** Change `PLAID_ENV=production` in `.env` and re-run `plaid_setup.py` with real bank credentials. Plaid requires a short security review before granting production access.
 
-- A browser window will open with Plaid Link
-- In sandbox, search for **First Platypus Bank** and use:
-  - Username: `user_good`
-  - Password: `pass_good`
-  - MFA code: `1234`
-- The terminal will print an access token — paste it into `.env`
-- Repeat for all three banks (Chase, Citi, Capital One)
+---
 
-> **Switching to production:** Change `PLAID_ENV=production` in `.env` and re-run `plaid_setup.py` with real bank credentials. Plaid requires a security review before granting production access.
+### 5. Google Sheets — spreadsheet output
 
-### 5. Set up Google Sheets
-
-1. Go to [console.cloud.google.com](https://console.cloud.google.com) and create a project
-2. Enable **Google Sheets API** and **Google Drive API**
-3. Go to **IAM & Admin → Service Accounts** → Create a service account with **Editor** role
-4. Under the service account's **Keys** tab → **Add Key → JSON** → download the file
+1. Go to [console.cloud.google.com](https://console.cloud.google.com) → create (or select) a project
+2. Enable **Google Sheets API** and **Google Drive API** under _APIs & Services → Library_
+3. Go to **IAM & Admin → Service Accounts** → **Create Service Account**
+   - Grant it the **Editor** role
+4. Open the service account → **Keys** tab → **Add Key → JSON** → download the file
 5. Rename it `service_account.json` and place it in the project folder
-6. Create a new Google Sheet and share it with the service account email (Editor access)
-7. Copy the Sheet ID from the URL (`/d/SHEET_ID/edit`) into `.env`
+6. Create a new Google Sheet and **share it** with the service account's email address (Editor access)
+7. Copy the Sheet ID from the URL (`docs.google.com/spreadsheets/d/SHEET_ID/edit`) into `.env`:
+   ```
+   GOOGLE_SHEET_ID=your_sheet_id
+   GOOGLE_SERVICE_ACCOUNT_FILE=service_account.json
+   ```
 
-### 6. Get a Gemini API key
+---
 
-1. Go to [aistudio.google.com](https://aistudio.google.com)
-2. Click **Get API Key** → **Create API key**
-3. Paste it into `.env` as `GEMINI_API_KEY`
+### 6. Gemini AI — categorization & summaries
 
-### 7. Set up the Discord bot
+1. Go to [aistudio.google.com](https://aistudio.google.com) → **Get API Key → Create API key**
+2. Add it to `.env`:
+   ```
+   GEMINI_API_KEY=your_api_key
+   ```
 
-1. Go to [discord.com/developers/applications](https://discord.com/developers/applications)
-2. Click **New Application** → name it `BudgetTrackerAI`
-3. Go to **Bot** tab → **Reset Token** → copy it into `.env` as `DISCORD_BOT_TOKEN`
-4. Under **Privileged Gateway Intents**, enable **Message Content Intent**
-5. Go to **OAuth2 → URL Generator**:
+> **Important:** Use the AI Studio key (free tier), **not** a Google Cloud key with billing enabled. The AI Studio free tier covers all normal usage of this bot.
+
+Free tier limits: 1,500 requests/day · 1M tokens/minute · 15 requests/minute — well above what the bot needs.
+
+---
+
+### 7. Discord bot — commands & alerts
+
+1. Go to [discord.com/developers/applications](https://discord.com/developers/applications) → **New Application**
+2. Go to the **Bot** tab:
+   - Click **Reset Token** and copy it into `.env` as `DISCORD_BOT_TOKEN`
+   - Under **Privileged Gateway Intents**, enable **Server Members Intent** and **Message Content Intent**
+3. Go to **OAuth2 → URL Generator**:
    - Scopes: `bot` + `applications.commands`
-   - Permissions: `Send Messages`, `View Channels`, `Use Slash Commands`, `Embed Links`
-6. Open the generated URL and invite the bot to your server
-7. Create two channels in your server:
-   - `#budget-tracker` — daily digest + alerts
-   - `#budget-review` — uncertain merchant categorization prompts
-8. Right-click each channel → **Copy Channel ID** → paste into `.env`
-9. Right-click your server name → **Copy Server ID** → paste as `DISCORD_GUILD_ID`
+   - Bot Permissions: `Send Messages`, `View Channels`, `Use Slash Commands`, `Embed Links`, `Add Reactions`
+4. Open the generated URL and invite the bot to your server
 
-> **Enable Developer Mode in Discord:** Settings → Advanced → Developer Mode
+5. Create **three channels** in your server:
+   | Channel | Purpose |
+   |---------|---------|
+   | `#budget-tracker` | Daily digest, sync results, budget alerts, large transaction alerts |
+   | `#budget-alerts` | Bank connection issues, subscription auto-updates (can be same as above) |
+   | `#budget-review` | Uncertain category prompts + subscription review dropdowns |
 
-### 8. Configure your budget limits
+6. Enable **Developer Mode** in Discord: _User Settings → Advanced → Developer Mode_
+7. Right-click each channel → **Copy Channel ID** → add to `.env`:
+   ```
+   DISCORD_CHANNEL_ID=111111111111111111        # #budget-tracker
+   DISCORD_ALERT_CHANNEL_ID=222222222222222222  # #budget-alerts
+   DISCORD_REVIEW_CHANNEL_ID=333333333333333333 # #budget-review
+   ```
+8. Right-click your server name → **Copy Server ID** → add to `.env`:
+   ```
+   DISCORD_GUILD_ID=444444444444444444
+   ```
 
-Edit `config.py` and set your monthly spending limits:
+---
+
+### 8. Configure budget limits
+
+Open `config.py` and set your monthly spending limits and alert thresholds to match your actual budget:
 
 ```python
 BUDGET_LIMITS = {
-    "Food and Drink":    600,
-    "Groceries":         400,
-    "Travel":            500,
-    "Entertainment":     200,
-    "Shopping":          300,
-    "Health and Fitness": 150,
-    "Gas":               200,
-    "Utilities":         250,
-    "Other":             300,
+    "Food and Drink":     600,
+    "Groceries":          500,
+    "Travel":             800,
+    "Entertainment":      300,
+    "Shopping":           300,
+    "Health and Fitness": 250,
+    "Gas":                150,
+    "Necessities":        1250,   # utilities, rent, etc.
+    "Other":              500,
 }
-```
 
-Also set your large transaction thresholds:
-
-```python
-LARGE_TRANSACTION_GLOBAL_THRESHOLD = 100  # fires if no category override matches
+LARGE_TRANSACTION_GLOBAL_THRESHOLD = 100   # fires if no category override matches
 
 LARGE_TRANSACTION_BY_CATEGORY = {
-    "Travel":   300,
-    "Groceries": 150,
-    "Gas":        80,
-    # ...
+    "Food and Drink":     75,
+    "Groceries":          150,
+    "Travel":             300,
+    "Entertainment":      100,
+    "Shopping":           150,
+    "Health and Fitness": 100,
+    "Gas":                80,
+    "Necessities":        200,
+    "Other":              100,
 }
 ```
+
+You can also adjust the timezone and sync schedule:
+
+```python
+TIMEZONE   = "America/Chicago"   # change to your local timezone
+SYNC_HOURS = [9, 21]             # 9 AM and 9 PM daily pulls
+```
+
+---
 
 ### 9. Run the bot
 
@@ -163,22 +218,102 @@ LARGE_TRANSACTION_BY_CATEGORY = {
 python main.py
 ```
 
-The bot will:
-- Sync slash commands to your server instantly on startup
+On first startup the bot will:
+- Initialize the SQLite database (`transactions.db`)
+- Sync slash commands to your server
 - Post a startup message to `#budget-tracker`
-- Begin the scheduled sync and digest tasks
+- Begin all scheduled tasks
 
 ---
 
 ## Discord Commands
 
+### Slash Commands
+
 | Command | Description |
 |---------|-------------|
 | `/sync` | Manually trigger a full transaction sync from all banks |
 | `/budget` | Show current month's spending vs limits for every category |
-| `/subscriptions` | List all recurring charges with estimated monthly costs |
-| `/recategorize` | Change a merchant's category (autocomplete search) |
-| `/add_account` | Instructions for linking a new credit card |
+| `/subscriptions` | List all tracked recurring charges with monthly cost estimates |
+| `/add_subscription` | Manually add a subscription (merchant, frequency, amount, tag) |
+| `/remove_subscription` | Remove a tracked subscription (with optional undo) |
+| `/recategorize` | Change a merchant's category permanently via a dropdown |
+| `/ask` | Ask Gemini a free-form question about your finances |
+| `/delete_transaction` | Delete one or more transactions by ID |
+| `/status` | Check the connection health of all linked bank accounts |
+| `/add_account` | Instructions for linking a new bank or credit card |
+| `/reauth` | Re-authenticate an expired bank connection |
+| `/annual` | Mark/unmark a merchant as an annual charge (prorates cost ÷ 12) |
+| `/set_webhook` | Set your public URL for Plaid real-time webhooks |
+
+### Natural Language Bot
+
+Mention the bot in any message (`@BudgetBot ...`) and it will understand plain English:
+
+```
+@BudgetBot add Netflix monthly $15.99
+@BudgetBot tag my Spotify subscription as "Justin only"
+@BudgetBot how much did I spend on food this month?
+@BudgetBot find my Walmart Plus subscription and add it
+@BudgetBot recategorize Target as Shopping
+@BudgetBot remove OpenAI from subscriptions
+@BudgetBot update my City of Plano subscription using transaction abc123, tag: Water & Trash
+@BudgetBot what's my biggest expense category this year?
+```
+
+The bot keeps the last 5 exchanges of conversation context per channel, so follow-ups work naturally:
+```
+@BudgetBot show my subscriptions
+@BudgetBot remove it    ← "it" resolves from context
+```
+
+---
+
+## Subscription Workflow
+
+### Auto-detection
+Every sync runs a pattern detector over your transaction history. Recurring charges (same merchant, consistent interval, consistent amount) are identified as subscriptions.
+
+**New merchants** are never auto-saved — instead, a single review message appears in `#budget-review` with a dropdown showing all detected candidates. All are pre-selected; deselect any that aren't real subscriptions, then click **Save Selected**.
+
+**Already-tracked** subscriptions are updated silently on every sync (refreshed amounts and dates).
+
+### Variable-amount subscriptions
+Bills like electricity or water that vary each month can be tracked without a fixed price. The bot stores an average and updates it automatically when each real charge arrives.
+
+### Estimate amounts
+If you don't know the exact price yet, add the subscription with a rough estimate. When the actual charge posts, the bot auto-updates the subscription and clears the estimate flag — no action needed from you.
+
+### Tags
+Any subscription can have a short personal label:
+```
+@BudgetBot tag Netflix as "Family plan"
+```
+Tags appear in `/subscriptions` and the Google Sheet.
+
+### Previous charge indicator
+`/subscriptions` shows an ↑/↓ trend arrow when the most recent charge differs from the prior one:
+```
+Netflix — $17.99 ↑ (was $15.99) · Monthly
+```
+
+---
+
+## Category Review Workflow
+
+When Gemini is less than 75% confident about a merchant's category, it flags it for review instead of auto-saving. After a sync, a single paginated review message appears in `#budget-review`:
+
+```
+❓ Categorize Transactions — 1 of 6  (0 done, 6 remaining)
+> Merchant: Target
+> Amount: $43.21 · Date: 2026-05-10 · Bank: Chase
+> Gemini's best guess: Shopping  (72% confident)
+
+Pick the correct category — selecting one auto-advances to the next:
+[ Shopping ▼ ]   [ ◀ Prev ]  [ Next ▶ ]  [ ⏭️ Skip ]  [ ✅ Done ]
+```
+
+Selecting a category saves it permanently and advances to the next merchant automatically. All categorizations are stored in the `merchant_categories` SQLite table — the same merchant is never asked about twice.
 
 ---
 
@@ -186,30 +321,32 @@ The bot will:
 
 | Tab | Contents |
 |-----|----------|
-| **Chase** | All Chase transactions — Date, Merchant, Category, Amount, Status, Custom Category |
-| **Citi** | All Citi transactions |
-| **Capital One** | All Capital One transactions |
-| **Summary** | Monthly totals per category vs budget limits |
-| **Subscriptions** | Recurring charges and income streams from all banks |
+| **[Bank Name]** | All transactions for that bank — Date, Merchant, Category, Amount, Status, Tag, Custom Category |
+| **Summary** | Monthly totals per category vs budget limits, YTD chart, per-bank date ranges |
+| **Subscriptions** | All tracked recurring charges — merchant, tag, frequency, amount, next charge date, category, bank |
 
-### Recategorizing via Sheets
+### Overriding a category via Sheets
+Fill in the **Custom Category** column on any transaction row. The next sync will:
+1. Apply the new category to that merchant permanently
+2. Rewrite all past and future transactions for that merchant
+3. Clear the Custom Category cell
 
-Fill in the **Custom Category** column (column H) on any transaction row with a valid category name. The next sync will pick it up, update the merchant cache permanently, and rewrite all matching transactions.
+Valid categories: `Food and Drink`, `Groceries`, `Travel`, `Entertainment`, `Shopping`, `Health and Fitness`, `Gas`, `Necessities`, `Other`, `Excluded`
 
-Valid categories:
-`Food and Drink`, `Groceries`, `Travel`, `Entertainment`, `Shopping`, `Health and Fitness`, `Gas`, `Utilities`, `Other`
+> Setting a category to `Excluded` hides the merchant from all budget calculations and alerts.
 
 ---
 
 ## Scheduled Tasks
 
-| Time | Action |
-|------|--------|
-| 9:00 AM | Sync transactions from all banks → update Sheet → fire any alerts |
-| 9:00 PM | Same as 9am sync |
-| 10:00 AM | Post daily budget digest to `#budget-tracker` with Gemini summary |
+| Time | Task |
+|------|------|
+| 9:00 AM | Full sync (Plaid → DB → Sheets) + budget/large-txn alerts + subscription charge reminders |
+| 9:00 PM | Full sync (same as above) |
+| 9:00 AM | Morning budget digest — month overview, upcoming subscription charges |
+| 11:59 PM | Evening recap — today's transactions listed individually, per-category totals, Gemini narrative |
 
-Times use the timezone set in `config.py` (`TIMEZONE = "America/New_York"` by default).
+All times use the `TIMEZONE` set in `config.py` (default: `America/New_York`).
 
 ---
 
@@ -218,89 +355,71 @@ Times use the timezone set in `config.py` (`TIMEZONE = "America/New_York"` by de
 ### Plaid
 | Tier | Cost |
 |------|------|
-| Sandbox | Free (unlimited, fake data) |
-| Production | $0.30 per connected account/month |
+| Sandbox | Free (test data only) |
+| Production | ~$0.30 per connected account / month |
 
-With 10 credit cards across 3 banks, expect **~$3.00/month**.
+Connecting 3 banks with 5 cards total ≈ **$1.50/month**.
 
-> You choose which accounts to connect during Plaid Link — deselect accounts you don't need to minimize cost.
-
-### Gemini AI
-| Usage | Estimated Cost |
-|-------|---------------|
-| Per merchant categorization | ~$0.0001 |
-| Daily digest + alerts | ~$0.001/day |
-| Monthly total (typical) | **< $0.10/month** |
-
-Gemini caches results by merchant name — the same merchant is never re-categorized, keeping API calls minimal.
+### Gemini AI (Google AI Studio — free tier)
+| Usage | Cost |
+|-------|------|
+| Per merchant categorization | $0 (cached after first categorization) |
+| Daily digests + alerts | $0 |
+| Monthly total | **$0** on the free tier |
 
 ### Google Sheets API
-Free within standard quota (read/write limits well above what this bot uses).
+Free within standard quota (well above what this bot uses).
 
 ### Discord Bot
 Free.
 
-**Total estimated monthly cost in production: ~$3.10/month**
-
----
-
-## Limitations
-
-### Plaid
-- **Sandbox data is fake** — transactions, merchants, and amounts are all test data. Switch to `PLAID_ENV=production` when ready to use real bank data.
-- **Transaction history** — Plaid provides up to 24 months of history depending on the bank. Not all banks guarantee the full 2 years.
-- **Pending transactions** — shown in the Sheet but excluded from budget calculations and alerts. Pending amounts may change before they post.
-- **Recurring detection** — Plaid's recurring transaction detection requires a history of charges. Newly opened accounts or new subscriptions may not be detected immediately.
-- **Bank connectivity** — Plaid connections can occasionally expire and require re-authentication. Run `python plaid_setup.py` again for the affected bank if this happens.
-- **New credit cards** — adding a new card requires re-running `python plaid_setup.py` for that bank, or using the `/add_account` command.
-
-### Gemini AI
-- **Categorization accuracy** — Gemini uses the merchant name and Plaid's raw category hint. Ambiguous or generic merchant names (e.g. `FUN`, `ACH PAYMENT`) may be categorized incorrectly. These are flagged in `#budget-review` for manual review.
-- **Not a financial advisor** — AI-generated budget summaries and insights are for informational purposes only.
-
-### Google Sheets
-- **Overwrites on every sync** — the Sheet is fully rewritten each sync. Any manual edits outside the Custom Category column will be lost.
-- **Custom Category column** — only fill this in when you want to permanently override a merchant's category. It is cleared after each sync once the override is applied.
-
-### Discord Bot
-- **Must be running** — the bot needs to be running on your machine for scheduled syncs and alerts to fire. If your computer is off at 9am, that sync will be skipped.
-- **Slash command propagation** — commands are synced guild-specifically on startup for instant availability. Global sync can take up to 1 hour.
+**Estimated total: ~$1.50/month** (just Plaid production accounts).
 
 ---
 
 ## Troubleshooting
 
-**Bot not showing slash commands**
-Make sure the bot has been invited with `applications.commands` scope and that `DISCORD_GUILD_ID` is set correctly in `.env`.
+**`PrivilegedIntentsRequired` on startup**
+Go to [discord.com/developers/applications](https://discord.com/developers/applications) → your app → **Bot** → enable **Server Members Intent** and **Message Content Intent**.
 
-**Plaid `client_id` error**
-Your `PLAID_CLIENT_ID` or `PLAID_SECRET` in `.env` is missing or still a placeholder. Get them from [dashboard.plaid.com](https://dashboard.plaid.com) → Team Settings → Keys.
+**Slash commands not appearing in Discord**
+Ensure the bot was invited with the `applications.commands` scope and that `DISCORD_GUILD_ID` is set in `.env`. Commands sync to your specific server on startup.
 
-**Google Sheets 404 error**
-Your `GOOGLE_SHEET_ID` is wrong, or the sheet hasn't been shared with the service account email.
+**`Unknown interaction` error in logs**
+A slash command timed out before responding. All slow commands use `defer()` so this shouldn't happen — if it does, check that your machine isn't under heavy load when the command runs.
 
-**Gemini `API key not valid` error**
-Your `GEMINI_API_KEY` is missing or invalid. Get a free key at [aistudio.google.com](https://aistudio.google.com).
+**Plaid `INVALID_ACCESS_TOKEN` error**
+Your Plaid access token has expired or the bank connection needs re-authentication. Run `/reauth` in Discord or re-run `python plaid_setup.py` for that bank.
 
-**Bot is online but channels show nothing**
-Ensure the bot has `Send Messages` and `View Channel` permissions in those specific channels, and that the channel IDs in `.env` are correct.
+**Google Sheets 404 / permission error**
+Either `GOOGLE_SHEET_ID` is wrong, or the sheet hasn't been shared with the service account email (found in `service_account.json` under `"client_email"`).
+
+**Gemini `API_KEY_INVALID` error**
+Your `GEMINI_API_KEY` is missing or invalid. Make sure you're using an **AI Studio** key from [aistudio.google.com](https://aistudio.google.com), not a Google Cloud key.
+
+**Bot is online but nothing appears in channels**
+Check that the bot has `Send Messages` and `View Channel` permissions in each specific channel, and that all three channel IDs in `.env` are correct.
+
+**Subscriptions not being detected**
+Plaid's recurring detection needs a history of at least 2–3 charges. New subscriptions or newly linked accounts may not show up immediately. Use `/add_subscription` or ask the NL bot to add them manually.
 
 ---
 
 ## Security Notes
 
-- Never commit your `.env` file or `service_account.json` — both are in `.gitignore`
-- Your Plaid access tokens grant read-only access to transaction data — they cannot move money
-- The `merchant_cache.json`, `alerted_ids.json`, and `uncertain_merchants.json` files are local runtime state and are also excluded from version control
-- Run in sandbox mode during development — no real financial data is ever accessed until you switch to production
+- **Never commit `.env` or `service_account.json`** — both are in `.gitignore`
+- **Plaid access tokens** grant read-only access to transaction history — they cannot initiate payments or transfers
+- **Gemini API key** — use the AI Studio key on the free tier to avoid any billing exposure
+- **SQLite database** (`transactions.db`) contains your full transaction history — keep it local and backed up
+- **Sandbox mode** during development — no real financial data is accessed until you switch `PLAID_ENV=production`
 
 ---
 
 ## Built With
 
-- [Plaid](https://plaid.com) — bank connectivity
-- [Google Gemini 2.5 Flash](https://aistudio.google.com) — AI categorization and summaries
+- [Plaid](https://plaid.com) — bank connectivity and transaction data
+- [Google Gemini 2.5 Flash](https://aistudio.google.com) — AI categorization, summaries, and NL commands
+- [discord.py 2.x](https://discordpy.readthedocs.io) — Discord bot framework with slash commands and UI components
 - [gspread](https://github.com/burnash/gspread) — Google Sheets integration
-- [discord.py](https://discordpy.readthedocs.io) — Discord bot framework
-- [APScheduler](https://apscheduler.readthedocs.io) — scheduled tasks
-- [pandas](https://pandas.pydata.org) — data processing
+- [python-dotenv](https://github.com/theskumar/python-dotenv) — environment variable management
+- [SQLite](https://sqlite.org) — local database for transactions, subscriptions, and merchant categories
