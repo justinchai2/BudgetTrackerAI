@@ -32,6 +32,7 @@ from db import (
     upsert_subscriptions, get_subscriptions, delete_subscription,
     refresh_next_charge_dates, get_today_transactions, get_transaction_by_id,
     find_merchant_transactions, auto_update_subscriptions_from_transactions,
+    rename_subscription,
 )
 from budget_engine import check_budget_overages, check_large_transactions, get_budget_summary
 import annual as annual_mgr
@@ -1494,6 +1495,24 @@ async def _dispatch_action(action: str, params: dict) -> str:
                     f"the next time a recurring charge is detected in your transactions. "
                     f"If it doesn't show up, you can also add it manually: "
                     f"\"add {merchant} as a subscription\".")
+
+    # ── rename_subscription ───────────────────────────────────────────────
+    elif action == "rename_subscription":
+        old_merchant = params.get("old_merchant", "").strip()
+        new_merchant = params.get("new_merchant", "").strip()
+        if not old_merchant or not new_merchant:
+            return "I need both the current name and the new name to rename a subscription."
+        success = rename_subscription(old_merchant, new_merchant)
+        if not success:
+            return (f"❌ No subscription found matching **{old_merchant}**.\n"
+                    f"> Use `/subscriptions` to see the exact merchant names being tracked.")
+        # Sync the renamed entry to Google Sheets
+        all_subs = get_subscriptions()
+        if all_subs:
+            sync_subscriptions(all_subs)
+        return (f"✏️ Renamed **{old_merchant}** → **{new_merchant}**.\n"
+                f"> Merchant ID preserved — category history and links are intact.\n"
+                f"> Google Sheet updated.")
 
     # ── update_subscription ───────────────────────────────────────────────
     elif action == "update_subscription":

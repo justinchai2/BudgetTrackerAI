@@ -132,18 +132,47 @@ def init_db():
                 sample_amount REAL,
                 sample_date   TEXT,
                 sample_bank   TEXT,
-                confirmed_at  TEXT
+                confirmed_at  TEXT,
+                merchant_id   TEXT UNIQUE
             )
         """)
+        # Migrate: add merchant_id column to existing tables
+        try:
+            conn.execute("ALTER TABLE merchant_categories ADD COLUMN merchant_id TEXT UNIQUE")
+            print("[db] Migrated merchant_categories: added column 'merchant_id'")
+        except sqlite3.OperationalError:
+            pass
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_mc_uncertain "
             "ON merchant_categories(is_uncertain)"
         )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_mc_merchant_id "
+            "ON merchant_categories(merchant_id)"
+        )
+
+        # Backfill merchant_id for any rows that don't have one yet
+        _backfill_merchant_ids(conn)
 
         # ── One-time migration from JSON files ────────────────────────────
         _migrate_category_json(conn)
 
     print("[db] Initialized")
+
+
+def _backfill_merchant_ids(conn):
+    """Generate stable UUIDs for any merchant_categories rows that don't have one yet."""
+    import uuid as _uuid
+    rows = conn.execute(
+        "SELECT merchant FROM merchant_categories WHERE merchant_id IS NULL"
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE merchant_categories SET merchant_id = ? WHERE merchant = ?",
+            (str(_uuid.uuid4()), row["merchant"]),
+        )
+    if rows:
+        print(f"[db] Backfilled merchant_id for {len(rows)} merchant_categories row(s)")
 
 
 def _migrate_category_json(conn):
@@ -821,7 +850,7 @@ def get_all_merchant_categories() -> dict[str, str]:
 def get_uncertain_merchants() -> dict:
     """
     Return uncertain merchants as:
-      {merchant: {category, confidence, sample: {amount, date, bank}}}
+      {merchant: {merchant_id, category, confidence, sample: {amount, date, bank}}}
     """
     with _get_conn() as conn:
         rows = conn.execute(
@@ -830,8 +859,9 @@ def get_uncertain_merchants() -> dict:
     result = {}
     for r in rows:
         result[r["merchant"]] = {
-            "category":   r["category"],
-            "confidence": r["confidence"],
+            "merchant_id": r["merchant_id"],
+            "category":    r["category"],
+            "confidence":  r["confidence"],
             "sample": {
                 "amount": r["sample_amount"],
                 "date":   r["sample_date"],
@@ -843,26 +873,29 @@ def get_uncertain_merchants() -> dict:
 def save_merchant_category(merchant: str, category: str, source: str = "gemini",
                             confidence: float = 1.0, is_uncertain: bool = False,
                             sample: dict | None = None):
-    """Insert or update a merchant's category."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """Insert or update a merchant's category. Generates a stable merchant_id on first insert."""
+    import uuid as _uuid
+    now    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sample = sample or {}
+    mid    = str(_uuid.uuid4())   # only used if this is a brand-new row
     with _get_conn() as conn:
         conn.execute("""
             INSERT INTO merchant_categories
-                (merchant, category, source, confidence, is_uncertain,
+                (merchant, merchant_id, category, source, confidence, is_uncertain,
                  sample_amount, sample_date, sample_bank, confirmed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(merchant) DO UPDATE SET
-                category     = excluded.category,
-                source       = excluded.source,
-                confidence   = excluded.confidence,
-                is_uncertain = excluded.is_uncertain,
+                category      = excluded.category,
+                source        = excluded.source,
+                confidence    = excluded.confidence,
+                is_uncertain  = excluded.is_uncertain,
                 sample_amount = COALESCE(excluded.sample_amount, merchant_categories.sample_amount),
                 sample_date   = COALESCE(excluded.sample_date,   merchant_categories.sample_date),
                 sample_bank   = COALESCE(excluded.sample_bank,   merchant_categories.sample_bank),
                 confirmed_at  = excluded.confirmed_at
+                -- merchant_id is intentionally NOT updated on conflict (stays stable forever)
         """, (
-            merchant, category, source, confidence, int(is_uncertain),
+            merchant, mid, category, source, confidence, int(is_uncertain),
             sample.get("amount"), sample.get("date"), sample.get("bank"),
             now if not is_uncertain else None,
         ))
@@ -870,22 +903,53 @@ def save_merchant_category(merchant: str, category: str, source: str = "gemini",
 def confirm_merchant_category(merchant: str, category: str):
     """
     Mark a merchant as user-confirmed: update category, clear uncertain flag,
-    set confirmed_at timestamp.
+    set confirmed_at timestamp.  Generates a merchant_id if this is a new row.
     """
+    import uuid as _uuid
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    mid = str(_uuid.uuid4())
     with _get_conn() as conn:
         conn.execute("""
             INSERT INTO merchant_categories
-                (merchant, category, source, confidence, is_uncertain, confirmed_at)
-            VALUES (?, ?, 'user', 1.0, 0, ?)
+                (merchant, merchant_id, category, source, confidence, is_uncertain, confirmed_at)
+            VALUES (?, ?, ?, 'user', 1.0, 0, ?)
             ON CONFLICT(merchant) DO UPDATE SET
                 category     = excluded.category,
                 source       = 'user',
                 confidence   = 1.0,
                 is_uncertain = 0,
                 confirmed_at = excluded.confirmed_at
-        """, (merchant, category, now))
+                -- merchant_id preserved on conflict
+        """, (merchant, mid, category, now))
     print(f"[db] Confirmed category: '{merchant}' → '{category}'")
+
+
+def rename_subscription(old_merchant: str, new_merchant: str) -> bool:
+    """
+    Rename a subscription merchant in both the subscriptions and merchant_categories
+    tables.  The merchant_id in merchant_categories stays unchanged — it is the
+    stable identifier that survives name changes.
+    Returns True if the subscription was found and renamed, False otherwise.
+    """
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT merchant FROM subscriptions WHERE LOWER(merchant) = LOWER(?)",
+            (old_merchant,)
+        ).fetchone()
+        if not row:
+            return False
+        actual_old = row["merchant"]
+
+        conn.execute(
+            "UPDATE subscriptions SET merchant = ? WHERE merchant = ?",
+            (new_merchant, actual_old),
+        )
+        conn.execute(
+            "UPDATE merchant_categories SET merchant = ? WHERE LOWER(merchant) = LOWER(?)",
+            (new_merchant, actual_old),
+        )
+    print(f"[db] Renamed subscription: '{actual_old}' → '{new_merchant}'")
+    return True
 
 
 def _to_dict(row):

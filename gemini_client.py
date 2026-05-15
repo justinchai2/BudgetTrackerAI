@@ -429,6 +429,15 @@ remove_subscription
   params: merchant (str)
   example: "remove OpenAI from subscriptions"
 
+rename_subscription
+  params: old_merchant (str), new_merchant (str)
+  use when the user wants to rename a subscription to a different display name.
+  The merchant_id stays stable so history and category links are preserved.
+  examples:
+    "rename Netflix to Netflix Premium"        → old_merchant: "Netflix", new_merchant: "Netflix Premium"
+    "change Spotify USA to just Spotify"       → old_merchant: "Spotify USA", new_merchant: "Spotify"
+    "rename NETFLIX.COM to Netflix"            → old_merchant: "NETFLIX.COM", new_merchant: "Netflix"
+
 restore_subscription
   params: merchant (str)
   use when the user wants to bring back a subscription they previously removed/blacklisted.
