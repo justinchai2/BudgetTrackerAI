@@ -464,19 +464,28 @@ update_subscription
   params: merchant (str), transaction_id (str, optional), frequency (str, optional),
           category (str, optional),
           tag (str, optional — short personal label shown next to the subscription name)
-  Two modes:
+  Three modes:
     • Tag / metadata update (no transaction ID needed): when the user just wants to set
       a tag, change the frequency, or recategorize an existing subscription by name.
       Only provide merchant + the fields to change.
-    • Transaction-based update: when the user gives a transaction ID and wants that
-      transaction's amount/date/bank applied to a subscription entry.
-      Provide transaction_id (and optionally merchant as a name override).
+    • Create OR update from transaction ID: when the user provides a transaction ID and
+      wants to CREATE a new subscription from it, or update an existing one with that
+      transaction's real amount/date/bank. Works even if no subscription exists yet.
+      Provide transaction_id (and optionally merchant as a cleaner name override).
+  Use this action any time the user says "create", "add", "make", or "set up" a
+  subscription AND provides a transaction ID — even if they don't say "update".
   The tag is a short personal note (e.g. "Family plan", "Water & Trash", "Justin only").
   examples:
     "tag my Netflix subscription as Family plan"
       → merchant: "Netflix", tag: "Family plan"
     "label Spotify as Justin only"
       → merchant: "Spotify", tag: "Justin only"
+    "create a subscription from transaction abc123"
+      → transaction_id: "abc123"
+    "make a City of Plano subscription using transaction abc123"
+      → transaction_id: "abc123", merchant: "City of Plano"
+    "add transaction xyz789 as my water bill, monthly"
+      → transaction_id: "xyz789", merchant: "Water Bill", frequency: "Monthly"
     "update my City of Plano subscription using transaction abc123, tag: Water & Trash"
       → transaction_id: "abc123", merchant: "City of Plano", tag: "Water & Trash"
     "use transaction xyz to set my water bill subscription"
